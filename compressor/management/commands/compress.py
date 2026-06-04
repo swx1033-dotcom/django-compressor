@@ -1,6 +1,7 @@
 # flake8: noqa
 import os
 import sys
+import time
 import concurrent.futures
 from threading import Lock
 
@@ -22,6 +23,8 @@ from compressor.cache import (
     get_offline_hexdigest,
     write_offline_manifest,
     get_offline_manifest,
+    get_manifest_metadata,
+    flush_offline_manifest,
 )
 from compressor.conf import settings
 from compressor.exceptions import (
@@ -79,6 +82,16 @@ class Command(BaseCommand):
             "multiple engines. If not specified, django engine is used.",
             dest="engines",
         )
+        parser.add_argument(
+            "--incremental",
+            "-i",
+            default=False,
+            action="store_true",
+            help="Enable incremental mode. Only reprocess templates that have "
+            "changed since the last compression. Uses mtime comparison against "
+            "the manifest metadata. Significantly faster for large projects.",
+            dest="incremental",
+        )
 
     def get_loaders(self):
         template_source_loaders = []
@@ -125,7 +138,7 @@ class Command(BaseCommand):
 
         return parser
 
-    def compress(self, engine, extensions, verbosity, follow_links, log):
+    def compress(self, engine, extensions, verbosity, follow_links, log, incremental=False):
         """
         Searches templates containing 'compress' nodes and compresses them
         "offline" -- outside of the request/response cycle.
@@ -218,6 +231,42 @@ class Command(BaseCommand):
         if verbosity >= 1:
             log.write("Compressing... ")
 
+        template_mtime_map = {}
+        if incremental:
+            existing_manifest = get_offline_manifest()
+            metadata = get_manifest_metadata()
+            templates_to_process = set()
+            timeout = settings.COMPRESS_OFFLINE_INCREMENTAL_TIMEOUT
+            current_time = time.time()
+
+            for template_name in templates:
+                template_path = None
+                for path in paths if engine == "django" else []:
+                    candidate = os.path.join(path, template_name)
+                    if os.path.exists(candidate):
+                        template_path = candidate
+                        break
+
+                if template_path and os.path.exists(template_path):
+                    current_mtime = os.path.getmtime(template_path)
+                    template_mtime_map[template_name] = current_mtime
+
+                    if template_name in metadata:
+                        last_mtime = metadata[template_name].get("mtime", 0)
+                        last_processed = metadata[template_name].get("last_processed", 0)
+                        if current_mtime > last_mtime or (current_time - last_processed) > timeout:
+                            templates_to_process.add(template_name)
+                    else:
+                        templates_to_process.add(template_name)
+
+            if verbosity >= 2:
+                log.write(
+                    "Incremental mode: %d templates changed out of %d total\n"
+                    % (len(templates_to_process), len(templates))
+                )
+
+            templates = templates_to_process if templates_to_process else set()
+
         for template_name in templates:
             try:
                 template = parser.parse(template_name)
@@ -306,7 +355,7 @@ class Command(BaseCommand):
                 "done\nCompressed %d block(s) from %d template(s) for %d context(s).\n"
                 % (len(offline_manifest), nodes_count, contexts_count)
             )
-        return offline_manifest, len(offline_manifest), offline_manifest.values()
+        return offline_manifest, len(offline_manifest), offline_manifest.values(), template_mtime_map if incremental else {}
 
     @staticmethod
     def _compress_template(offline_manifest, nodes, parser, template, errors):
@@ -398,16 +447,31 @@ class Command(BaseCommand):
         follow_links = options.get("follow_links", False)
         extensions = self.handle_extensions(options.get("extensions") or ["html"])
         engines = [e.strip() for e in options.get("engines", [])] or ["django"]
+        incremental = options.get("incremental", False)
 
         final_offline_manifest = {}
         final_block_count = 0
         final_results = []
+        all_template_mtimes = {}
+
+        if incremental:
+            final_offline_manifest = get_offline_manifest()
+            all_template_mtimes = get_manifest_metadata()
+
         for engine in engines:
-            offline_manifest, block_count, results = self.compress(
-                engine, extensions, verbosity, follow_links, log
+            offline_manifest, block_count, results, template_mtimes = self.compress(
+                engine, extensions, verbosity, follow_links, log, incremental
             )
             final_results.extend(results)
             final_block_count += block_count
             final_offline_manifest.update(offline_manifest)
-        write_offline_manifest(final_offline_manifest)
+            if incremental and template_mtimes:
+                current_time = time.time()
+                for template_name, mtime in template_mtimes.items():
+                    all_template_mtimes[template_name] = {
+                        "mtime": mtime,
+                        "last_processed": current_time,
+                    }
+
+        write_offline_manifest(final_offline_manifest, all_template_mtimes if incremental else None)
         return final_block_count, final_results

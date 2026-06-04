@@ -77,10 +77,33 @@ def get_offline_manifest():
         filename = settings.COMPRESS_OFFLINE_MANIFEST
         if default_offline_manifest_storage.exists(filename):
             with default_offline_manifest_storage.open(filename) as fp:
-                _offline_manifest = json.loads(fp.read().decode("utf8"))
+                raw_manifest = json.loads(fp.read().decode("utf8"))
+                _offline_manifest = extract_manifest_data(raw_manifest)
         else:
             _offline_manifest = {}
     return _offline_manifest
+
+
+def extract_manifest_data(raw_manifest):
+    if "__meta__" in raw_manifest:
+        return {k: v for k, v in raw_manifest.items() if k != "__meta__"}
+    return raw_manifest
+
+
+def get_manifest_metadata():
+    raw_manifest = get_raw_offline_manifest()
+    if "__meta__" in raw_manifest:
+        return raw_manifest["__meta__"]
+    return {}
+
+
+def get_raw_offline_manifest():
+    filename = settings.COMPRESS_OFFLINE_MANIFEST
+    if default_offline_manifest_storage.exists(filename):
+        with default_offline_manifest_storage.open(filename) as fp:
+            return json.loads(fp.read().decode("utf8"))
+    else:
+        return {}
 
 
 def flush_offline_manifest():
@@ -88,8 +111,13 @@ def flush_offline_manifest():
     _offline_manifest = None
 
 
-def write_offline_manifest(manifest):
-    content = json.dumps(manifest, indent=2).encode("utf8")
+def write_offline_manifest(manifest, metadata=None):
+    if metadata:
+        full_manifest = {"__meta__": metadata}
+        full_manifest.update(manifest)
+        content = json.dumps(full_manifest, indent=2).encode("utf8")
+    else:
+        content = json.dumps(manifest, indent=2).encode("utf8")
     default_offline_manifest_storage.save(
         settings.COMPRESS_OFFLINE_MANIFEST, ContentFile(content)
     )
