@@ -1,0 +1,476 @@
+diff --git a/compressor/cache.py b/compressor/cache.py
+index c5dabbf..dff916a 100644
+--- a/compressor/cache.py
++++ b/compressor/cache.py
+@@ -3,6 +3,7 @@ import hashlib
+ import os
+ import socket
+ import time
++from copy import deepcopy
+ from importlib import import_module
+ 
+ from django.core.cache import caches
+@@ -159,4 +160,27 @@ def cache_set(key, val, refreshed=False, timeout=None):
+     return cache.set(key, packed_val, real_timeout)
+ 
+ 
++_METADATA_KEY = "_incremental_metadata"
++
++
++def get_offline_manifest_with_metadata():
++    manifest = get_offline_manifest()
++    raw_metadata = manifest.get(_METADATA_KEY, {})
++    metadata = deepcopy(raw_metadata) if isinstance(raw_metadata, dict) else {}
++    return manifest, metadata
++
++
++def write_offline_manifest_with_metadata(manifest, metadata):
++    if metadata:
++        manifest[_METADATA_KEY] = metadata
++    write_offline_manifest(manifest)
++
++
++def get_template_mtime(template_path):
++    try:
++        return os.path.getmtime(template_path)
++    except OSError:
++        return None
++
++
+ cache = SimpleLazyObject(lambda: caches[settings.COMPRESS_CACHE_BACKEND])
+diff --git a/compressor/conf.py b/compressor/conf.py
+index 6b90dbc..70b45d0 100644
+--- a/compressor/conf.py
++++ b/compressor/conf.py
+@@ -78,6 +78,9 @@ class CompressorConf(AppConf):
+     OFFLINE = False
+     # invalidates the offline cache after one year
+     OFFLINE_TIMEOUT = 60 * 60 * 24 * 365  # 1 year
++    # Forces full regeneration when using incremental mode after this many seconds.
++    # Default: 7 days. Set to 0 to always allow incremental.
++    OFFLINE_INCREMENTAL_TIMEOUT = 60 * 60 * 24 * 7  # 7 days
+     # The context to be used when compressing the files "offline"
+     OFFLINE_CONTEXT = {}
+     # The name of the manifest file (e.g. filename.ext)
+diff --git a/compressor/management/commands/compress.py b/compressor/management/commands/compress.py
+index bcf6cf6..f71c8a1 100644
+--- a/compressor/management/commands/compress.py
++++ b/compressor/management/commands/compress.py
+@@ -22,6 +22,7 @@ from compressor.cache import (
+     get_offline_hexdigest,
+     write_offline_manifest,
+     get_offline_manifest,
++    get_template_mtime,
+ )
+ from compressor.conf import settings
+ from compressor.exceptions import (
+@@ -29,6 +30,7 @@ from compressor.exceptions import (
+     TemplateSyntaxError,
+     TemplateDoesNotExist,
+ )
++from compressor.offline import OfflineCompressor
+ from compressor.utils import get_mod_func
+ 
+ offline_manifest_lock = Lock()
+@@ -79,6 +81,15 @@ class Command(BaseCommand):
+             "multiple engines. If not specified, django engine is used.",
+             dest="engines",
+         )
++        parser.add_argument(
++            "--incremental",
++            default=False,
++            action="store_true",
++            help="Enable incremental compression mode. Only templates "
++            "whose mtime has changed since the last run will be "
++            "re-processed. Significantly faster for large projects.",
++            dest="incremental",
++        )
+ 
+     def get_loaders(self):
+         template_source_loaders = []
+@@ -125,7 +136,8 @@ class Command(BaseCommand):
+ 
+         return parser
+ 
+-    def compress(self, engine, extensions, verbosity, follow_links, log):
++    def compress(self, engine, extensions, verbosity, follow_links, log,
++                 offline_manifest=None, template_filter=None):
+         """
+         Searches templates containing 'compress' nodes and compresses them
+         "offline" -- outside of the request/response cycle.
+@@ -141,63 +153,9 @@ class Command(BaseCommand):
+                 "settings or set 'loaders' in your "
+                 "TEMPLATES dictionary."
+             )
+-        templates = set()
+-        if engine == "django":
+-            paths = set()
+-            for loader in self.get_loaders():
+-                try:
+-                    module = import_module(loader.__module__)
+-                    get_template_sources = getattr(module, "get_template_sources", None)
+-                    if get_template_sources is None:
+-                        get_template_sources = loader.get_template_sources
+-                    paths.update(
+-                        smart_str(origin) for origin in get_template_sources("")
+-                    )
+-                except (ImportError, AttributeError, TypeError):
+-                    # Yeah, this didn't work out so well, let's move on
+-                    pass
+-
+-            if not paths:
+-                raise OfflineGenerationError(
+-                    "No template paths found. None of "
+-                    "the configured template loaders "
+-                    "provided template paths. See "
+-                    "https://docs.djangoproject.com/en/2.1/topics/templates/ "
+-                    "for more information on template "
+-                    "loaders."
+-                )
+-            if verbosity >= 2:
+-                log.write("Considering paths:\n\t" + "\n\t".join(paths) + "\n")
+-
+-            for path in paths:
+-                for root, dirs, files in os.walk(path, followlinks=follow_links):
+-                    templates.update(
+-                        os.path.relpath(os.path.join(root, name), path)
+-                        for name in files
+-                        if not name.startswith(".")
+-                        and any(fnmatch(name, "*%s" % glob) for glob in extensions)
+-                    )
+-        elif engine == "jinja2":
+-            env = settings.COMPRESS_JINJA2_GET_ENVIRONMENT()
+-            if env and hasattr(env, "list_templates"):
+-                templates |= set(
+-                    [
+-                        env.loader.get_source(env, template)[1]
+-                        for template in env.list_templates(
+-                            filter_func=lambda _path: os.path.splitext(_path)[-1]
+-                            in extensions
+-                        )
+-                    ]
+-                )
+-
+-        if not templates:
+-            raise OfflineGenerationError(
+-                "No templates found. Make sure your "
+-                "TEMPLATE_LOADERS and TEMPLATE_DIRS "
+-                "settings are correct."
+-            )
+-        if verbosity >= 2:
+-            log.write("Found templates:\n\t" + "\n\t".join(templates) + "\n")
++        templates = self._discover_templates(
++            [engine], extensions, follow_links, log, verbosity
++        )
+ 
+         contexts = settings.COMPRESS_OFFLINE_CONTEXT
+         if isinstance(contexts, str):
+@@ -219,6 +177,8 @@ class Command(BaseCommand):
+             log.write("Compressing... ")
+ 
+         for template_name in templates:
++            if template_filter is not None and template_name not in template_filter:
++                continue
+             try:
+                 template = parser.parse(template_name)
+                 template.template_name = template_name
+@@ -247,7 +207,11 @@ class Command(BaseCommand):
+ 
+         contexts_count = 0
+         nodes_count = 0
+-        offline_manifest = OrderedDict()
++        if offline_manifest is not None:
++            offline_manifest = offline_manifest
++        else:
++            offline_manifest = OrderedDict()
++        template_key_map = {}
+         errors = []
+ 
+         for context_dict in contexts:
+@@ -279,6 +243,9 @@ class Command(BaseCommand):
+                 template._log = log
+                 template._log_verbosity = verbosity
+ 
++                template_key_list = []
++                template_key_map[template.template_name] = template_key_list
++
+                 pool.submit(
+                     self._compress_template,
+                     offline_manifest,
+@@ -286,6 +253,7 @@ class Command(BaseCommand):
+                     parser,
+                     template,
+                     errors,
++                    template_key_list,
+                 )
+ 
+             pool.shutdown(wait=True)
+@@ -306,10 +274,11 @@ class Command(BaseCommand):
+                 "done\nCompressed %d block(s) from %d template(s) for %d context(s).\n"
+                 % (len(offline_manifest), nodes_count, contexts_count)
+             )
+-        return offline_manifest, len(offline_manifest), offline_manifest.values()
++        return offline_manifest, len(offline_manifest), offline_manifest.values(), template_key_map
+ 
+     @staticmethod
+-    def _compress_template(offline_manifest, nodes, parser, template, errors):
++    def _compress_template(offline_manifest, nodes, parser, template, errors,
++                           template_key_list=None):
+         for node, node_contexts in nodes.items():
+             for context in node_contexts:
+                 context.push()
+@@ -330,6 +299,9 @@ class Command(BaseCommand):
+ 
+                     offline_manifest[key] = None
+ 
++                if template_key_list is not None:
++                    template_key_list.append(key)
++
+                 node_id = id(node)
+ 
+                 with node_locks_lock:
+@@ -346,6 +318,8 @@ class Command(BaseCommand):
+                         )
+                     )
+                     del offline_manifest[key]
++                    if template_key_list is not None and key in template_key_list:
++                        template_key_list.remove(key)
+                     return
+                 finally:
+                     with node_locks_lock:
+@@ -398,12 +372,18 @@ class Command(BaseCommand):
+         follow_links = options.get("follow_links", False)
+         extensions = self.handle_extensions(options.get("extensions") or ["html"])
+         engines = [e.strip() for e in options.get("engines", [])] or ["django"]
++        incremental = options.get("incremental", False)
++
++        if incremental:
++            return self._handle_incremental(
++                engines, extensions, verbosity, follow_links, log
++            )
+ 
+         final_offline_manifest = {}
+         final_block_count = 0
+         final_results = []
+         for engine in engines:
+-            offline_manifest, block_count, results = self.compress(
++            offline_manifest, block_count, results, _ = self.compress(
+                 engine, extensions, verbosity, follow_links, log
+             )
+             final_results.extend(results)
+@@ -411,3 +391,124 @@ class Command(BaseCommand):
+             final_offline_manifest.update(offline_manifest)
+         write_offline_manifest(final_offline_manifest)
+         return final_block_count, final_results
++
++    def _handle_incremental(self, engines, extensions, verbosity, follow_links, log):
++        all_templates = self._discover_templates(
++            engines, extensions, follow_links, log, verbosity
++        )
++
++        compressor = OfflineCompressor()
++        changed = compressor.generate_manifest_incremental(all_templates)
++
++        if verbosity >= 1:
++            if not changed:
++                log.write("No templates changed. Nothing to compress.\n")
++            else:
++                log.write(
++                    "%d of %d template(s) changed. Compressing incrementally.\n"
++                    % (len(changed), len(all_templates))
++                )
++
++        if not changed:
++            compressor.save_manifest()
++            return 0, []
++
++        final_offline_manifest = compressor.manifest
++        final_block_count = 0
++        final_results = []
++
++        for engine in engines:
++            offline_manifest, block_count, results, template_key_map = self.compress(
++                engine, extensions, verbosity, follow_links, log,
++                offline_manifest=final_offline_manifest,
++                template_filter=changed,
++            )
++            final_results.extend(results)
++            final_block_count += block_count
++
++            for template_name, keys in template_key_map.items():
++                compressor.record_template_keys(template_name, keys)
++                mtime = get_template_mtime(template_name)
++                if mtime is not None:
++                    compressor.record_template_mtime(template_name, mtime)
++
++        compressor.save_manifest()
++
++        if verbosity >= 1:
++            log.write(
++                "done\nCompressed %d block(s) from %d template(s).\n"
++                % (len(final_offline_manifest), len(changed))
++            )
++        return final_block_count, final_results
++
++    def _discover_templates(self, engines, extensions, follow_links, log, verbosity):
++        templates = set()
++        for engine in engines:
++            if engine == "django":
++                paths = set()
++                for loader in self.get_loaders():
++                    try:
++                        module = import_module(loader.__module__)
++                        get_template_sources = getattr(
++                            module, "get_template_sources", None
++                        )
++                        if get_template_sources is None:
++                            get_template_sources = loader.get_template_sources
++                        paths.update(
++                            smart_str(origin)
++                            for origin in get_template_sources("")
++                        )
++                    except (ImportError, AttributeError, TypeError):
++                        pass
++
++                if not paths:
++                    raise OfflineGenerationError(
++                        "No template paths found. None of "
++                        "the configured template loaders "
++                        "provided template paths. See "
++                        "https://docs.djangoproject.com/en/2.1/topics/templates/ "
++                        "for more information on template "
++                        "loaders."
++                    )
++                if verbosity >= 2:
++                    log.write(
++                        "Considering paths:\n\t" + "\n\t".join(paths) + "\n"
++                    )
++
++                for path in paths:
++                    for root, dirs, files in os.walk(
++                        path, followlinks=follow_links
++                    ):
++                        templates.update(
++                            os.path.relpath(os.path.join(root, name), path)
++                            for name in files
++                            if not name.startswith(".")
++                            and any(
++                                fnmatch(name, "*%s" % glob) for glob in extensions
++                            )
++                        )
++            elif engine == "jinja2":
++                env = settings.COMPRESS_JINJA2_GET_ENVIRONMENT()
++                if env and hasattr(env, "list_templates"):
++                    templates |= set(
++                        [
++                            env.loader.get_source(env, template)[1]
++                            for template in env.list_templates(
++                                filter_func=lambda _path: os.path.splitext(
++                                    _path
++                                )[-1]
++                                in extensions
++                            )
++                        ]
++                    )
++
++        if not templates:
++            raise OfflineGenerationError(
++                "No templates found. Make sure your "
++                "TEMPLATE_LOADERS and TEMPLATE_DIRS "
++                "settings are correct."
++            )
++        if verbosity >= 2:
++            log.write("Found templates:\n\t" + "\n\t".join(templates) + "\n")
++
++        return templates
+diff --git a/compressor/offline/__init__.py b/compressor/offline/__init__.py
+index e69de29..3609fe1 100644
+--- a/compressor/offline/__init__.py
++++ b/compressor/offline/__init__.py
+@@ -0,0 +1,85 @@
++import time
++
++from compressor.cache import (
++    get_offline_manifest_with_metadata,
++    write_offline_manifest_with_metadata,
++    get_template_mtime,
++)
++from compressor.conf import settings
++
++
++class OfflineCompressor:
++    def __init__(self):
++        self.manifest = {}
++        self.metadata = {}
++
++    def load_manifest(self):
++        self.manifest, self.metadata = get_offline_manifest_with_metadata()
++
++    def should_force_full(self):
++        timeout = settings.COMPRESS_OFFLINE_INCREMENTAL_TIMEOUT
++        if not timeout:
++            return False
++        created_at = self.metadata.get("created_at")
++        if created_at is None:
++            return True
++        return (time.time() - created_at) > timeout
++
++    def get_changed_templates(self, all_template_paths):
++        last_modified = self.metadata.get("last_modified", {})
++        template_keys = self.metadata.get("template_keys", {})
++
++        all_template_paths_set = set(all_template_paths)
++
++        for path in list(last_modified.keys()):
++            if path not in all_template_paths_set:
++                keys = template_keys.pop(path, [])
++                for key in keys:
++                    self.manifest.pop(key, None)
++                last_modified.pop(path, None)
++
++        changed = []
++        for path in all_template_paths:
++            current_mtime = get_template_mtime(path)
++            if current_mtime is None:
++                continue
++            stored_mtime = last_modified.get(path)
++            if stored_mtime is None or current_mtime != stored_mtime:
++                changed.append(path)
++                keys = template_keys.pop(path, [])
++                for key in keys:
++                    self.manifest.pop(key, None)
++                last_modified.pop(path, None)
++
++        return changed
++
++    def record_template_keys(self, template_path, keys):
++        if "template_keys" not in self.metadata:
++            self.metadata["template_keys"] = {}
++        self.metadata["template_keys"][template_path] = list(keys)
++
++    def record_template_mtime(self, template_path, mtime):
++        if "last_modified" not in self.metadata:
++            self.metadata["last_modified"] = {}
++        self.metadata["last_modified"][template_path] = mtime
++
++    def save_manifest(self):
++        write_offline_manifest_with_metadata(self.manifest, self.metadata)
++
++    def generate_manifest_incremental(self, all_template_paths):
++        self.load_manifest()
++
++        if self.should_force_full():
++            self.manifest = {}
++            self.metadata = {
++                "created_at": time.time(),
++                "last_modified": {},
++                "template_keys": {},
++            }
++            return set(all_template_paths)
++
++        if "created_at" not in self.metadata:
++            self.metadata["created_at"] = time.time()
++
++        changed = set(self.get_changed_templates(all_template_paths))
++        return changed
+\ No newline at end of file

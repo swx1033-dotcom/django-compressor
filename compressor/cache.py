@@ -3,6 +3,7 @@ import hashlib
 import os
 import socket
 import time
+from copy import deepcopy
 from importlib import import_module
 
 from django.core.cache import caches
@@ -157,6 +158,29 @@ def cache_set(key, val, refreshed=False, timeout=None):
     real_timeout = timeout + settings.COMPRESS_MINT_DELAY
     packed_val = (val, refresh_time, refreshed)
     return cache.set(key, packed_val, real_timeout)
+
+
+_METADATA_KEY = "_incremental_metadata"
+
+
+def get_offline_manifest_with_metadata():
+    manifest = get_offline_manifest()
+    raw_metadata = manifest.get(_METADATA_KEY, {})
+    metadata = deepcopy(raw_metadata) if isinstance(raw_metadata, dict) else {}
+    return manifest, metadata
+
+
+def write_offline_manifest_with_metadata(manifest, metadata):
+    if metadata:
+        manifest[_METADATA_KEY] = metadata
+    write_offline_manifest(manifest)
+
+
+def get_template_mtime(template_path):
+    try:
+        return os.path.getmtime(template_path)
+    except OSError:
+        return None
 
 
 cache = SimpleLazyObject(lambda: caches[settings.COMPRESS_CACHE_BACKEND])

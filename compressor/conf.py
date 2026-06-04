@@ -78,6 +78,9 @@ class CompressorConf(AppConf):
     OFFLINE = False
     # invalidates the offline cache after one year
     OFFLINE_TIMEOUT = 60 * 60 * 24 * 365  # 1 year
+    # Forces full regeneration when using incremental mode after this many seconds.
+    # Default: 7 days. Set to 0 to always allow incremental.
+    OFFLINE_INCREMENTAL_TIMEOUT = 60 * 60 * 24 * 7  # 7 days
     # The context to be used when compressing the files "offline"
     OFFLINE_CONTEXT = {}
     # The name of the manifest file (e.g. filename.ext)
