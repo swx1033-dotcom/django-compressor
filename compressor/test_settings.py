@@ -19,8 +19,9 @@ DATABASES = {
 
 INSTALLED_APPS = [
     "django.contrib.staticfiles",
-    "compressor",
+    "compressor.apps.CompressorConfig",
     "sekizai",
+    "compressor.tests.test_app",
 ]
 
 STATICFILES_FINDERS = [

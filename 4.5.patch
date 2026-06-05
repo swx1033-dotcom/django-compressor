@@ -1,0 +1,334 @@
+diff --git a/compressor/apps.py b/compressor/apps.py
+new file mode 100644
+index 0000000..25f2513
+--- /dev/null
++++ b/compressor/apps.py
+@@ -0,0 +1,42 @@
++import importlib
++import logging
++from pathlib import Path
++
++from django.apps import AppConfig
++from django.conf import settings
++
++logger = logging.getLogger(__name__)
++
++
++class CompressorConfig(AppConfig):
++    name = 'compressor'
++    verbose_name = 'Django Compressor'
++
++    def ready(self):
++        self._auto_discover_filters()
++
++    def _auto_discover_filters(self):
++        """
++        Automatically discover and register filters from installed apps.
++        
++        Iterates through all installed Django apps and imports their
++        filters.py module if it exists. This triggers the @register_filter
++        decorator to register any filter classes defined in those modules.
++        """
++        for app_config in settings.INSTALLED_APPS:
++            app_module_path = app_config
++            filters_module = f"{app_module_path}.filters"
++            
++            try:
++                importlib.import_module(filters_module)
++                logger.debug(f"Successfully imported filters module from {app_module_path}")
++            except ModuleNotFoundError:
++                pass
++            except ImportError as e:
++                logger.warning(
++                    f"Error importing filters module from {app_module_path}: {e}"
++                )
++            except Exception as e:
++                logger.warning(
++                    f"Unexpected error while importing filters from {app_module_path}: {e}"
++                )
+diff --git a/compressor/base.py b/compressor/base.py
+index 280c16a..f31f1cf 100644
+--- a/compressor/base.py
++++ b/compressor/base.py
+@@ -17,7 +17,7 @@ from compressor.exceptions import (
+     UncompressableFileError,
+     FilterDoesNotExist,
+ )
+-from compressor.filters import CachedCompilerFilter
++from compressor.filters import CachedCompilerFilter, get_registered_filters
+ from compressor.storage import compressor_file_storage
+ from compressor.signals import post_compress
+ from compressor.utils import get_class, get_mod_func, staticfiles
+@@ -48,7 +48,19 @@ class Compressor:
+         **kwargs
+     ):
+         if filters is None:
+-            self.filters = settings.COMPRESS_FILTERS[resource_kind]
++            configured_filters = list(settings.COMPRESS_FILTERS.get(resource_kind, []))
++            registered_filters = get_registered_filters(resource_kind)
++            
++            if registered_filters:
++                registered_filter_paths = [
++                    f"{cls.__module__}.{cls.__name__}"
++                    for cls in registered_filters.values()
++                ]
++                for filter_path in registered_filter_paths:
++                    if filter_path not in configured_filters:
++                        configured_filters.append(filter_path)
++            
++            self.filters = configured_filters
+         else:
+             self.filters = filters
+         if output_prefix is None:
+diff --git a/compressor/filters/__init__.py b/compressor/filters/__init__.py
+index 0692071..e614a4d 100644
+--- a/compressor/filters/__init__.py
++++ b/compressor/filters/__init__.py
+@@ -6,3 +6,52 @@ from compressor.filters.base import (
+     CachedCompilerFilter,
+     FilterError,
+ )
++
++
++_filter_registry = {
++    'css': {},
++    'js': {},
++}
++
++
++def register_filter(filter_type, name=None):
++    """
++    Class decorator to register a filter class.
++    
++    Args:
++        filter_type: The type of filter, either 'js' or 'css'.
++        name: Optional name for the filter. If not provided, 
++              the class name will be used.
++    
++    Example:
++        @register_filter('css', name='my_custom_filter')
++        class MyCustomFilter(FilterBase):
++            def input(self, **kwargs):
++                return self.content.upper()
++    """
++    def decorator(cls):
++        if filter_type not in _filter_registry:
++            raise ValueError(
++                f"Invalid filter_type '{filter_type}'. Must be one of: {', '.join(_filter_registry.keys())}"
++            )
++        if not issubclass(cls, FilterBase):
++            raise TypeError(
++                f"Filter class must be a subclass of FilterBase, got {cls.__name__}"
++            )
++        filter_name = name or f"{cls.__module__}.{cls.__name__}"
++        _filter_registry[filter_type][filter_name] = cls
++        return cls
++    return decorator
++
++
++def get_registered_filters(filter_type):
++    """
++    Get all registered filters for a given filter type.
++    
++    Args:
++        filter_type: The type of filter, either 'js' or 'css'.
++    
++    Returns:
++        A dictionary of registered filters for the given type.
++    """
++    return _filter_registry.get(filter_type, {})
+diff --git a/compressor/test_settings.py b/compressor/test_settings.py
+index 960b4b3..89892b2 100644
+--- a/compressor/test_settings.py
++++ b/compressor/test_settings.py
+@@ -19,8 +19,9 @@ DATABASES = {
+ 
+ INSTALLED_APPS = [
+     "django.contrib.staticfiles",
+-    "compressor",
++    "compressor.apps.CompressorConfig",
+     "sekizai",
++    "compressor.tests.test_app",
+ ]
+ 
+ STATICFILES_FINDERS = [
+diff --git a/compressor/tests/test_app/__init__.py b/compressor/tests/test_app/__init__.py
+new file mode 100644
+index 0000000..bbc4b6e
+--- /dev/null
++++ b/compressor/tests/test_app/__init__.py
+@@ -0,0 +1 @@
++default_app_config = 'compressor.tests.test_app.apps.TestAppConfig'
+diff --git a/compressor/tests/test_app/apps.py b/compressor/tests/test_app/apps.py
+new file mode 100644
+index 0000000..81cda05
+--- /dev/null
++++ b/compressor/tests/test_app/apps.py
+@@ -0,0 +1,6 @@
++from django.apps import AppConfig
++
++
++class TestAppConfig(AppConfig):
++    name = 'compressor.tests.test_app'
++    verbose_name = 'Test App for Filter Registration'
+diff --git a/compressor/tests/test_app/filters.py b/compressor/tests/test_app/filters.py
+new file mode 100644
+index 0000000..066a816
+--- /dev/null
++++ b/compressor/tests/test_app/filters.py
+@@ -0,0 +1,31 @@
++from compressor.filters import register_filter, FilterBase
++
++
++@register_filter('css', name='test_uppercase')
++class TestUppercaseCssFilter(FilterBase):
++    """Test CSS filter that converts content to uppercase."""
++    
++    def input(self, **kwargs):
++        return self.content.upper()
++    
++    def output(self, **kwargs):
++        return self.content.upper()
++
++
++@register_filter('js', name='test_uppercase')
++class TestUppercaseJsFilter(FilterBase):
++    """Test JS filter that converts content to uppercase."""
++    
++    def input(self, **kwargs):
++        return self.content.upper()
++    
++    def output(self, **kwargs):
++        return self.content.upper()
++
++
++@register_filter('css')
++class TestAutoNameFilter(FilterBase):
++    """Test CSS filter with auto-generated name."""
++    
++    def input(self, **kwargs):
++        return self.content.replace('test', 'TEST')
+diff --git a/compressor/tests/test_filter_registration.py b/compressor/tests/test_filter_registration.py
+new file mode 100644
+index 0000000..e3d0357
+--- /dev/null
++++ b/compressor/tests/test_filter_registration.py
+@@ -0,0 +1,118 @@
++from django.test import TestCase, override_settings
++from django.test.utils import setup_test_environment
++
++from compressor.filters import register_filter, FilterBase, get_registered_filters
++from compressor.base import Compressor
++
++
++class FilterRegistrationTestCase(TestCase):
++    """Test cases for the filter registration decorator mechanism."""
++
++    def test_register_filter_decorator(self):
++        """Test that the decorator properly registers filter classes."""
++        from compressor.tests.test_app.filters import (
++            TestUppercaseCssFilter,
++            TestUppercaseJsFilter,
++            TestAutoNameFilter,
++        )
++        
++        css_filters = get_registered_filters('css')
++        js_filters = get_registered_filters('js')
++        
++        self.assertIn('test_uppercase', css_filters)
++        self.assertIs(css_filters['test_uppercase'], TestUppercaseCssFilter)
++        
++        self.assertIn('test_uppercase', js_filters)
++        self.assertIs(js_filters['test_uppercase'], TestUppercaseJsFilter)
++        
++        auto_name = 'compressor.tests.test_app.filters.TestAutoNameFilter'
++        self.assertIn(auto_name, css_filters)
++        self.assertIs(css_filters[auto_name], TestAutoNameFilter)
++
++    def test_register_filter_invalid_type(self):
++        """Test that registering with invalid filter_type raises ValueError."""
++        with self.assertRaises(ValueError) as context:
++            @register_filter('invalid_type')
++            class InvalidFilter(FilterBase):
++                def input(self, **kwargs):
++                    return self.content
++        
++        self.assertIn("Invalid filter_type", str(context.exception))
++
++    def test_register_filter_non_subclass(self):
++        """Test that registering a non-FilterBase subclass raises TypeError."""
++        with self.assertRaises(TypeError) as context:
++            @register_filter('css')
++            class NotAFilter:
++                pass
++        
++        self.assertIn("must be a subclass of FilterBase", str(context.exception))
++
++    @override_settings(INSTALLED_APPS=[
++        'django.contrib.staticfiles',
++        'compressor',
++        'compressor.tests.test_app',
++    ])
++    def test_auto_discovery(self):
++        """Test that filters are auto-discovered from installed apps."""
++        from compressor.apps import CompressorConfig
++        from compressor.conf import settings
++        
++        config = CompressorConfig('compressor', 'compressor')
++        config._auto_discover_filters()
++        
++        css_filters = get_registered_filters('css')
++        self.assertIn('test_uppercase', css_filters)
++
++    def test_filter_execution(self):
++        """Test that registered filters can be executed correctly."""
++        from compressor.tests.test_app.filters import TestUppercaseCssFilter
++        
++        content = "body { color: red; }"
++        filter_instance = TestUppercaseCssFilter(content, filter_type='css')
++        
++        result = filter_instance.input()
++        self.assertEqual(result, "BODY { COLOR: RED; }")
++        
++        result = filter_instance.output()
++        self.assertEqual(result, "BODY { COLOR: RED; }")
++
++    @override_settings(COMPRESS_FILTERS={
++        'css': ['compressor.filters.css_default.CssAbsoluteFilter'],
++        'js': ['compressor.filters.jsmin.rJSMinFilter'],
++    })
++    def test_compress_filters_merges_registered_filters(self):
++        """Test that Compressor merges registered filters with configured filters."""
++        from compressor.tests.test_app.filters import TestUppercaseCssFilter
++        
++        compressor = Compressor('css', content='body { color: red; }')
++        
++        filter_paths = compressor.filters
++        
++        configured_filter = 'compressor.filters.css_default.CssAbsoluteFilter'
++        self.assertIn(configured_filter, filter_paths)
++        
++        registered_filter = 'compressor.tests.test_app.filters.TestAutoNameFilter'
++        self.assertIn(registered_filter, filter_paths)
++
++    @override_settings(COMPRESS_FILTERS={
++        'css': [
++            'compressor.filters.css_default.CssAbsoluteFilter',
++            'compressor.tests.test_app.filters.TestAutoNameFilter',
++        ],
++        'js': ['compressor.filters.jsmin.rJSMinFilter'],
++    })
++    def test_configured_filters_have_priority(self):
++        """Test that configured filters have priority and registered filters are not duplicated."""
++        compressor = Compressor('css', content='body { color: red; }')
++        
++        filter_paths = compressor.filters
++        
++        count = filter_paths.count('compressor.tests.test_app.filters.TestAutoNameFilter')
++        self.assertEqual(count, 1, "Filter should not be duplicated")
++        
++        self.assertEqual(
++            filter_paths.index('compressor.filters.css_default.CssAbsoluteFilter'),
++            0,
++            "Configured filters should come first"
++        )
