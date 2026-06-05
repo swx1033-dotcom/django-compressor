@@ -1,0 +1,130 @@
+diff --git a/compressor/conf.py b/compressor/conf.py
+index 6b90dbc..64d7073 100644
+--- a/compressor/conf.py
++++ b/compressor/conf.py
+@@ -90,6 +90,8 @@ class CompressorConf(AppConf):
+     # Affects manifest file contents only.
+     URL_PLACEHOLDER = "/__compressor_url_placeholder__/"
+ 
++    PARALLEL_WORKERS = os.cpu_count() or 1
++
+     # Returns the Jinja2 environment to use in offline compression.
+     def JINJA2_GET_ENVIRONMENT():
+         alias = "jinja2"
+diff --git a/compressor/management/commands/compress.py b/compressor/management/commands/compress.py
+index bcf6cf6..eedd27f 100644
+--- a/compressor/management/commands/compress.py
++++ b/compressor/management/commands/compress.py
+@@ -79,6 +79,13 @@ class Command(BaseCommand):
+             "multiple engines. If not specified, django engine is used.",
+             dest="engines",
+         )
++        parser.add_argument(
++            "--parallel",
++            default=False,
++            action="store_true",
++            help="Enable parallel processing for offline compression.",
++            dest="parallel",
++        )
+ 
+     def get_loaders(self):
+         template_source_loaders = []
+@@ -125,7 +132,7 @@ class Command(BaseCommand):
+ 
+         return parser
+ 
+-    def compress(self, engine, extensions, verbosity, follow_links, log):
++    def compress(self, engine, extensions, verbosity, follow_links, log, parallel=False):
+         """
+         Searches templates containing 'compress' nodes and compresses them
+         "offline" -- outside of the request/response cycle.
+@@ -274,21 +281,59 @@ class Command(BaseCommand):
+                         nodes_count += 1
+                         template_nodes.setdefault(node, []).append(context)
+ 
+-            pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+-            for template, nodes in compressor_nodes.items():
+-                template._log = log
+-                template._log_verbosity = verbosity
+-
+-                pool.submit(
+-                    self._compress_template,
+-                    offline_manifest,
+-                    nodes,
+-                    parser,
+-                    template,
+-                    errors,
+-                )
++            if parallel:
++                import io
++                workers = getattr(settings, 'COMPRESS_PARALLEL_WORKERS', os.cpu_count() or 1)
++                pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
++                futures = []
++                parallel_failed = False
++                try:
++                    for template, nodes in compressor_nodes.items():
++                        string_log = io.StringIO()
++                        template._log = string_log
++                        template._log_verbosity = verbosity
++
++                        futures.append(
++                            (string_log, pool.submit(
++                                self._compress_template,
++                                offline_manifest,
++                                nodes,
++                                parser,
++                                template,
++                                errors,
++                            ))
++                        )
++
++                    for string_log, future in futures:
++                        future.result()
++                        log.write(string_log.getvalue())
++                except Exception as e:
++                    parallel_failed = True
++                    pool.shutdown(wait=False)
++                    if verbosity >= 1:
++                        log.write("Parallel processing failed: %s. Falling back to serial mode.\n" % e)
++                    # Clean up placeholders and errors
++                    errors.clear()
++                    with offline_manifest_lock:
++                        for k, v in list(offline_manifest.items()):
++                            if v is None:
++                                del offline_manifest[k]
++                finally:
++                    if not parallel_failed:
++                        pool.shutdown(wait=True)
++
++            if not parallel or parallel_failed:
++                for template, nodes in compressor_nodes.items():
++                    template._log = log
++                    template._log_verbosity = verbosity
++                    self._compress_template(
++                        offline_manifest,
++                        nodes,
++                        parser,
++                        template,
++                        errors,
++                    )
+ 
+-            pool.shutdown(wait=True)
+             contexts_count += 1
+ 
+         # If errors exist, raise the first one in the list
+@@ -398,13 +443,14 @@ class Command(BaseCommand):
+         follow_links = options.get("follow_links", False)
+         extensions = self.handle_extensions(options.get("extensions") or ["html"])
+         engines = [e.strip() for e in options.get("engines", [])] or ["django"]
++        parallel = options.get("parallel", False)
+ 
+         final_offline_manifest = {}
+         final_block_count = 0
+         final_results = []
+         for engine in engines:
+             offline_manifest, block_count, results = self.compress(
+-                engine, extensions, verbosity, follow_links, log
++                engine, extensions, verbosity, follow_links, log, parallel=parallel
+             )
+             final_results.extend(results)
+             final_block_count += block_count
