@@ -90,6 +90,8 @@ class CompressorConf(AppConf):
     # Affects manifest file contents only.
     URL_PLACEHOLDER = "/__compressor_url_placeholder__/"
 
+    PARALLEL_WORKERS = None
+
     # Returns the Jinja2 environment to use in offline compression.
     def JINJA2_GET_ENVIRONMENT():
         alias = "jinja2"
@@ -179,3 +181,8 @@ class CompressorConf(AppConf):
         if value in (None, ""):
             return None
         return str(value)
+
+    def configure_parallel_workers(self, value):
+        if value is None:
+            value = os.cpu_count() or 1
+        return value
