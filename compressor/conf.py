@@ -84,6 +84,10 @@ class CompressorConf(AppConf):
     OFFLINE_MANIFEST = "manifest.json"
     OFFLINE_MANIFEST_STORAGE_ALIAS = "compressor-offline"
     OFFLINE_MANIFEST_STORAGE = "compressor.storage.OfflineManifestFileStorage"
+    # The number of parallel workers for offline compression.
+    # Set to a positive integer to use parallel processing, or None to disable.
+    # Defaults to os.cpu_count() if not set and parallel mode is enabled.
+    PARALLEL_WORKERS = None
     # The Context to be used when TemplateFilter is used
     TEMPLATE_FILTER_CONTEXT = {}
     # Placeholder to be used instead of settings.COMPRESS_URL during offline compression.
