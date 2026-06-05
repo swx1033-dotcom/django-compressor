@@ -34,6 +34,7 @@ from compressor.utils import get_mod_func
 offline_manifest_lock = Lock()
 node_locks_lock = Lock()
 node_locks = defaultdict(Lock)
+log_lock = Lock()
 
 
 class Command(BaseCommand):
@@ -78,6 +79,13 @@ class Command(BaseCommand):
             "supported. It may be a specified more than once for "
             "multiple engines. If not specified, django engine is used.",
             dest="engines",
+        )
+        parser.add_argument(
+            "--parallel",
+            default=False,
+            action="store_true",
+            help="Enable parallel processing using ThreadPoolExecutor.",
+            dest="parallel",
         )
 
     def get_loaders(self):
@@ -125,7 +133,7 @@ class Command(BaseCommand):
 
         return parser
 
-    def compress(self, engine, extensions, verbosity, follow_links, log):
+    def compress(self, engine, extensions, verbosity, follow_links, log, parallel=False):
         """
         Searches templates containing 'compress' nodes and compresses them
         "offline" -- outside of the request/response cycle.
@@ -250,6 +258,19 @@ class Command(BaseCommand):
         offline_manifest = OrderedDict()
         errors = []
 
+        def process_templates_serial():
+            """串行处理模板的方法"""
+            for template, nodes in compressor_nodes.items():
+                template._log = log
+                template._log_verbosity = verbosity
+                self._compress_template(
+                    offline_manifest,
+                    nodes,
+                    parser,
+                    template,
+                    errors,
+                )
+
         for context_dict in contexts:
             compressor_nodes = OrderedDict()
             for template in fine_templates:
@@ -274,21 +295,35 @@ class Command(BaseCommand):
                         nodes_count += 1
                         template_nodes.setdefault(node, []).append(context)
 
-            pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
-            for template, nodes in compressor_nodes.items():
-                template._log = log
-                template._log_verbosity = verbosity
+            if parallel:
+                try:
+                    max_workers = settings.COMPRESS_PARALLEL_WORKERS
+                    pool = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+                    futures = []
+                    for template, nodes in compressor_nodes.items():
+                        template._log = log
+                        template._log_verbosity = verbosity
+                        future = pool.submit(
+                            self._compress_template,
+                            offline_manifest,
+                            nodes,
+                            parser,
+                            template,
+                            errors,
+                        )
+                        futures.append(future)
 
-                pool.submit(
-                    self._compress_template,
-                    offline_manifest,
-                    nodes,
-                    parser,
-                    template,
-                    errors,
-                )
+                    for future in concurrent.futures.as_completed(futures):
+                        future.result()
 
-            pool.shutdown(wait=True)
+                    pool.shutdown(wait=True)
+                except Exception:
+                    # 并行处理失败，降级到串行模式
+                    if verbosity >= 1:
+                        log.write("Parallel processing failed, falling back to serial mode.\n")
+                    process_templates_serial()
+            else:
+                process_templates_serial()
             contexts_count += 1
 
         # If errors exist, raise the first one in the list
@@ -398,13 +433,14 @@ class Command(BaseCommand):
         follow_links = options.get("follow_links", False)
         extensions = self.handle_extensions(options.get("extensions") or ["html"])
         engines = [e.strip() for e in options.get("engines", [])] or ["django"]
+        parallel = options.get("parallel", False)
 
         final_offline_manifest = {}
         final_block_count = 0
         final_results = []
         for engine in engines:
             offline_manifest, block_count, results = self.compress(
-                engine, extensions, verbosity, follow_links, log
+                engine, extensions, verbosity, follow_links, log, parallel
             )
             final_results.extend(results)
             final_block_count += block_count

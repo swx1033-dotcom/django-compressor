@@ -1,4 +1,5 @@
 import os
+import multiprocessing
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.template.utils import InvalidTemplateEngineError
@@ -84,11 +85,13 @@ class CompressorConf(AppConf):
     OFFLINE_MANIFEST = "manifest.json"
     OFFLINE_MANIFEST_STORAGE_ALIAS = "compressor-offline"
     OFFLINE_MANIFEST_STORAGE = "compressor.storage.OfflineManifestFileStorage"
-    # The Context to be used when TemplateFilter is used
+    # Context to be used when TemplateFilter is used
     TEMPLATE_FILTER_CONTEXT = {}
     # Placeholder to be used instead of settings.COMPRESS_URL during offline compression.
     # Affects manifest file contents only.
     URL_PLACEHOLDER = "/__compressor_url_placeholder__/"
+    # Number of worker threads to use for parallel compression
+    PARALLEL_WORKERS = multiprocessing.cpu_count()
 
     # Returns the Jinja2 environment to use in offline compression.
     def JINJA2_GET_ENVIRONMENT():
