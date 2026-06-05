@@ -1,0 +1,199 @@
+diff --git a/compressor/__init__.py b/compressor/__init__.py
+index e627568..6e72c59 100644
+--- a/compressor/__init__.py
++++ b/compressor/__init__.py
+@@ -1,2 +1,4 @@
+ # following PEP 386
+ __version__ = "4.6.0"
++
++default_app_config = "compressor.apps.CompressorConfig"
+diff --git a/compressor/apps.py b/compressor/apps.py
+new file mode 100644
+index 0000000..854002b
+--- /dev/null
++++ b/compressor/apps.py
+@@ -0,0 +1,29 @@
++import copy
++from django.apps import AppConfig
++from django.utils.module_loading import autodiscover_modules
++from compressor.conf import settings
++from compressor.filters import filter_registry
++
++
++class CompressorConfig(AppConfig):
++    name = 'compressor'
++    verbose_name = 'Compressor'
++
++    def ready(self):
++        autodiscover_modules('filters')
++        
++        if not any(filter_registry.values()):
++            return
++
++        new_filters = copy.deepcopy(settings.COMPRESS_FILTERS)
++        for filter_type, filters in filter_registry.items():
++            if filter_type not in new_filters:
++                new_filters[filter_type] = []
++            
++            existing = list(new_filters[filter_type])
++            for filter_path in filters:
++                if filter_path not in existing:
++                    existing.append(filter_path)
++            new_filters[filter_type] = existing
++            
++        settings.COMPRESS_FILTERS = new_filters
+diff --git a/compressor/filters/__init__.py b/compressor/filters/__init__.py
+index 0692071..c76f0f6 100644
+--- a/compressor/filters/__init__.py
++++ b/compressor/filters/__init__.py
+@@ -6,3 +6,21 @@ from compressor.filters.base import (
+     CachedCompilerFilter,
+     FilterError,
+ )
++
++filter_registry = {
++    'js': [],
++    'css': [],
++}
++
++def register_filter(filter_type, name=None):
++    """
++    Register a custom filter for django-compressor.
++    """
++    def decorator(cls):
++        dotted_path = f"{cls.__module__}.{cls.__name__}"
++        if filter_type not in filter_registry:
++            filter_registry[filter_type] = []
++        if dotted_path not in filter_registry[filter_type]:
++            filter_registry[filter_type].append(dotted_path)
++        return cls
++    return decorator
+diff --git a/run_my_test.py b/run_my_test.py
+new file mode 100644
+index 0000000..9c12013
+--- /dev/null
++++ b/run_my_test.py
+@@ -0,0 +1,66 @@
++import os
++import sys
++import django
++from django.conf import settings
++from compressor.base import Compressor
++
++def run_test():
++    settings.configure(
++        DEBUG=True,
++        INSTALLED_APPS=[
++            'compressor',
++            'test_app',
++        ],
++        COMPRESS_FILTERS={
++            'css': ['compressor.filters.css_default.CssAbsoluteFilter'],
++            'js': []
++        },
++        COMPRESS_ENABLED=True,
++        COMPRESS_ROOT='/tmp',
++        COMPRESS_URL='/static/',
++        TEMPLATES=[
++            {
++                'BACKEND': 'django.template.backends.django.DjangoTemplates',
++                'DIRS': [],
++                'APP_DIRS': True,
++                'OPTIONS': {
++                    'context_processors': [
++                        'django.template.context_processors.debug',
++                        'django.template.context_processors.request',
++                    ],
++                },
++            },
++        ],
++    )
++
++    django.setup()
++
++    from compressor.conf import settings as comp_settings
++
++    print("Registered CSS filters:", comp_settings.COMPRESS_FILTERS['css'])
++    print("Registered JS filters:", comp_settings.COMPRESS_FILTERS['js'])
++
++    assert 'test_app.filters.MyCustomCSSFilter' in comp_settings.COMPRESS_FILTERS['css']
++    assert 'test_app.filters.MyCustomJSFilter' in comp_settings.COMPRESS_FILTERS['js']
++
++    # Test CSS Filter
++    css_compressor = Compressor('css', content='body { color: black; }')
++    # Use output() to trigger filter
++    css_output = "\n".join(css_compressor.filter_input(forced=True))
++    css_filtered = css_compressor.filter_output(css_output)
++    
++    print("CSS Output:", css_filtered)
++    assert 'white' in css_filtered, "MyCustomCSSFilter was not executed!"
++
++    # Test JS Filter
++    js_compressor = Compressor('js', content='console.log("hello");')
++    js_output = "\n".join(js_compressor.filter_input(forced=True))
++    js_filtered = js_compressor.filter_output(js_output)
++    
++    print("JS Output:", js_filtered)
++    assert 'alert' in js_filtered, "MyCustomJSFilter was not executed!"
++
++    print("All tests passed successfully.")
++
++if __name__ == '__main__':
++    run_test()
+diff --git a/test_app/__init__.py b/test_app/__init__.py
+new file mode 100644
+index 0000000..88bb5df
+--- /dev/null
++++ b/test_app/__init__.py
+@@ -0,0 +1 @@
++default_app_config = 'test_app.apps.TestAppConfig'
+diff --git a/test_app/apps.py b/test_app/apps.py
+new file mode 100644
+index 0000000..d15f139
+--- /dev/null
++++ b/test_app/apps.py
+@@ -0,0 +1,4 @@
++from django.apps import AppConfig
++
++class TestAppConfig(AppConfig):
++    name = 'test_app'
+diff --git a/test_app/filters.py b/test_app/filters.py
+new file mode 100644
+index 0000000..010909d
+--- /dev/null
++++ b/test_app/filters.py
+@@ -0,0 +1,11 @@
++from compressor.filters import FilterBase, register_filter
++
++@register_filter('css', name='my_custom_css')
++class MyCustomCSSFilter(FilterBase):
++    def input(self, **kwargs):
++        return self.content.replace('black', 'white')
++
++@register_filter('js')
++class MyCustomJSFilter(FilterBase):
++    def input(self, **kwargs):
++        return self.content.replace('console.log', 'alert')
+diff --git a/test_apps.py b/test_apps.py
+new file mode 100644
+index 0000000..32ba0d8
+--- /dev/null
++++ b/test_apps.py
+@@ -0,0 +1,17 @@
++import os
++import django
++from django.conf import settings
++
++settings.configure(
++    INSTALLED_APPS=[
++        'compressor',
++    ],
++    COMPRESS_FILTERS={
++        'css': ['custom.css.Filter'],
++        'js': []
++    }
++)
++django.setup()
++
++from compressor.conf import settings as comp_settings
++print("COMPRESS_FILTERS after setup:", comp_settings.COMPRESS_FILTERS)
