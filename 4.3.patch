@@ -1,0 +1,332 @@
+diff --git a/compressor/apps.py b/compressor/apps.py
+new file mode 100644
+index 0000000..6b16b62
+--- /dev/null
++++ b/compressor/apps.py
+@@ -0,0 +1,28 @@
++import logging
++from importlib import import_module
++
++from django.apps import AppConfig, apps
++
++
++logger = logging.getLogger("compressor")
++
++
++class CompressorConfig(AppConfig):
++    name = "compressor"
++    verbose_name = "Django Compressor"
++
++    def ready(self):
++        self._discover_filters()
++
++    def _discover_filters(self):
++        for app_config in apps.get_app_configs():
++            if app_config.name == "compressor":
++                continue
++            try:
++                import_module("%s.filters" % app_config.name)
++            except ImportError:
++                pass
++            except Exception:
++                logger.exception(
++                    "Error importing filters from %s", app_config.name
++                )
+\ No newline at end of file
+diff --git a/compressor/base.py b/compressor/base.py
+index 280c16a..6d76bec 100644
+--- a/compressor/base.py
++++ b/compressor/base.py
+@@ -17,7 +17,7 @@ from compressor.exceptions import (
+     UncompressableFileError,
+     FilterDoesNotExist,
+ )
+-from compressor.filters import CachedCompilerFilter
++from compressor.filters import CachedCompilerFilter, get_registered_filters
+ from compressor.storage import compressor_file_storage
+ from compressor.signals import post_compress
+ from compressor.utils import get_class, get_mod_func, staticfiles
+@@ -48,7 +48,24 @@ class Compressor:
+         **kwargs
+     ):
+         if filters is None:
+-            self.filters = settings.COMPRESS_FILTERS[resource_kind]
++            self.filters = list(settings.COMPRESS_FILTERS[resource_kind])
++            registered = get_registered_filters().get(resource_kind, [])
++            if registered:
++                existing_paths = set()
++                for f in self.filters:
++                    if isinstance(f, str):
++                        existing_paths.add(f)
++                    elif hasattr(f, "__module__") and hasattr(f, "__qualname__"):
++                        existing_paths.add(
++                            f.__module__ + "." + f.__qualname__
++                        )
++                for reg_cls in registered:
++                    reg_path = (
++                        reg_cls.__module__ + "." + reg_cls.__qualname__
++                    )
++                    if reg_path not in existing_paths:
++                        self.filters.append(reg_cls)
++                        existing_paths.add(reg_path)
+         else:
+             self.filters = filters
+         if output_prefix is None:
+diff --git a/compressor/filters/__init__.py b/compressor/filters/__init__.py
+index 0692071..2aa65a0 100644
+--- a/compressor/filters/__init__.py
++++ b/compressor/filters/__init__.py
+@@ -6,3 +6,46 @@ from compressor.filters.base import (
+     CachedCompilerFilter,
+     FilterError,
+ )
++
++_registered_filters = {
++    "css": [],
++    "js": [],
++}
++
++
++def get_registered_filters():
++    return _registered_filters
++
++
++def register_filter(filter_type, name=None):
++    """
++    Class decorator for registering compressor filters.
++
++    Usage::
++
++        from compressor.filters import FilterBase, register_filter
++
++        @register_filter('css')
++        class MyCSSFilter(FilterBase):
++            def output(self, **kwargs):
++                return self.content.replace('foo', 'bar')
++
++    The decorated class is automatically discovered and made available
++    as a compressor filter, without needing to add it to COMPRESS_FILTERS.
++
++    :param filter_type: 'css' or 'js'
++    :param name: Optional name for the filter (not currently used for lookup)
++    """
++    if filter_type not in ("css", "js"):
++        raise ValueError(
++            'filter_type must be "css" or "js", got %r' % filter_type
++        )
++
++    def decorator(cls):
++        if cls not in _registered_filters[filter_type]:
++            _registered_filters[filter_type].append(cls)
++        cls._compressor_filter_type = filter_type
++        cls._compressor_filter_name = name or cls.__name__
++        return cls
++
++    return decorator
+\ No newline at end of file
+diff --git a/compressor/tests/test_app/__init__.py b/compressor/tests/test_app/__init__.py
+new file mode 100644
+index 0000000..0d3d512
+--- /dev/null
++++ b/compressor/tests/test_app/__init__.py
+@@ -0,0 +1 @@
++default_app_config = 'compressor.tests.test_app.apps.TestAppConfig'
+\ No newline at end of file
+diff --git a/compressor/tests/test_app/apps.py b/compressor/tests/test_app/apps.py
+new file mode 100644
+index 0000000..c27f805
+--- /dev/null
++++ b/compressor/tests/test_app/apps.py
+@@ -0,0 +1,6 @@
++from django.apps import AppConfig
++
++
++class TestAppConfig(AppConfig):
++    name = "compressor.tests.test_app"
++    verbose_name = "Test App for Filter Registration"
+\ No newline at end of file
+diff --git a/compressor/tests/test_app/filters.py b/compressor/tests/test_app/filters.py
+new file mode 100644
+index 0000000..eb1bccc
+--- /dev/null
++++ b/compressor/tests/test_app/filters.py
+@@ -0,0 +1,13 @@
++from compressor.filters import FilterBase, register_filter
++
++
++@register_filter("css")
++class UpperCaseCSSFilter(FilterBase):
++    def output(self, **kwargs):
++        return self.content.upper()
++
++
++@register_filter("js", name="upper_js")
++class UpperCaseJSFilter(FilterBase):
++    def output(self, **kwargs):
++        return self.content.upper()
+\ No newline at end of file
+diff --git a/compressor/tests/test_filters.py b/compressor/tests/test_filters.py
+index 3fca135..c32e831 100644
+--- a/compressor/tests/test_filters.py
++++ b/compressor/tests/test_filters.py
+@@ -619,3 +619,160 @@ class SpecializedFiltersTest(TestCase):
+         self.assertEqual(
+             filter.options, (("binary", str("cleancss")), ("args", str("")))
+         )
++
++
++class RegisterFilterDecoratorTestCase(TestCase):
++    def setUp(self):
++        from compressor.filters import _registered_filters
++
++        self._saved_registered = {
++            "css": list(_registered_filters["css"]),
++            "js": list(_registered_filters["js"]),
++        }
++
++    def tearDown(self):
++        from compressor.filters import _registered_filters
++
++        _registered_filters["css"][:] = self._saved_registered["css"]
++        _registered_filters["js"][:] = self._saved_registered["js"]
++
++    def test_decorator_registers_class(self):
++        from compressor.filters import _registered_filters, register_filter, FilterBase
++
++        @register_filter("css")
++        class MyTestCSSFilter(FilterBase):
++            def output(self, **kwargs):
++                return self.content.upper()
++
++        self.assertIn(MyTestCSSFilter, _registered_filters["css"])
++        self.assertEqual(MyTestCSSFilter._compressor_filter_type, "css")
++        self.assertEqual(MyTestCSSFilter._compressor_filter_name, "MyTestCSSFilter")
++
++    def test_decorator_with_custom_name(self):
++        from compressor.filters import _registered_filters, register_filter, FilterBase
++
++        @register_filter("js", name="my_custom_js")
++        class MyTestJSFilter(FilterBase):
++            def output(self, **kwargs):
++                return self.content.upper()
++
++        self.assertIn(MyTestJSFilter, _registered_filters["js"])
++        self.assertEqual(MyTestJSFilter._compressor_filter_type, "js")
++        self.assertEqual(MyTestJSFilter._compressor_filter_name, "my_custom_js")
++
++    def test_decorator_duplicate_registration(self):
++        from compressor.filters import _registered_filters, register_filter, FilterBase
++
++        @register_filter("css")
++        class DuplicateFilter(FilterBase):
++            def output(self, **kwargs):
++                return self.content
++
++        @register_filter("css")
++        class DuplicateFilter(FilterBase):
++            def output(self, **kwargs):
++                return self.content
++
++        count = len(
++            [f for f in _registered_filters["css"] if f is DuplicateFilter]
++        )
++        self.assertEqual(count, 1)
++
++    def test_invalid_filter_type(self):
++        from compressor.filters import register_filter, FilterBase
++
++        with self.assertRaises(ValueError):
++
++            @register_filter("invalid")
++            class BadFilter(FilterBase):
++                pass
++
++    def test_auto_discovery_imports_test_app_filters(self):
++        from compressor.filters import _registered_filters
++        from importlib import import_module
++
++        import_module("compressor.tests.test_app.filters")
++
++        registered_names = [
++            f._compressor_filter_name
++            for f in _registered_filters["css"]
++        ]
++        self.assertIn("UpperCaseCSSFilter", registered_names)
++
++        registered_names_js = [
++            f._compressor_filter_name
++            for f in _registered_filters["js"]
++        ]
++        self.assertIn("upper_js", registered_names_js)
++
++    @override_settings(
++        COMPRESS_ENABLED=True,
++        COMPRESS_FILTERS={"css": []},
++    )
++    def test_registered_filter_merged_into_compressor(self):
++        from compressor.css import CssCompressor
++        from compressor.filters import _registered_filters, register_filter, FilterBase
++
++        @register_filter("css")
++        class UpperCaseCSSFilter(FilterBase):
++            def output(self, **kwargs):
++                return self.content.upper()
++
++        css = '<style type="text/css">p { color: red; }</style>'
++        css_node = CssCompressor("css", css)
++        self.assertIn(UpperCaseCSSFilter, css_node.cached_filters)
++        output = css_node.filter_output("p { color: red; }")
++        self.assertEqual(output, "P { COLOR: RED; }")
++
++    @override_settings(
++        COMPRESS_ENABLED=True,
++        COMPRESS_FILTERS={"css": ["compressor.filters.css_default.CssAbsoluteFilter"]},
++    )
++    def test_registered_filter_appended_with_existing_filters(self):
++        from compressor.css import CssCompressor
++        from compressor.filters import _registered_filters, register_filter, FilterBase
++        from compressor.filters.css_default import CssAbsoluteFilter
++
++        @register_filter("css")
++        class UpperCaseCSSFilter(FilterBase):
++            def output(self, **kwargs):
++                return self.content.upper()
++
++        css = '<style type="text/css">p { color: red; }</style>'
++        css_node = CssCompressor("css", css)
++        self.assertIn(CssAbsoluteFilter, css_node.cached_filters)
++        self.assertIn(UpperCaseCSSFilter, css_node.cached_filters)
++
++    @override_settings(
++        COMPRESS_ENABLED=True,
++        COMPRESS_FILTERS={"css": ["compressor.filters.css_default.CssRelativeFilter"]},
++    )
++    def test_explicit_filters_not_overridden(self):
++        from compressor.css import CssCompressor
++        from compressor.filters import _registered_filters, register_filter, FilterBase
++        from compressor.filters.css_default import CssRelativeFilter
++
++        @register_filter("css")
++        class UpperCaseCSSFilter(FilterBase):
++            def output(self, **kwargs):
++                return self.content.upper()
++
++        css = '<style type="text/css">p { color: red; }</style>'
++        css_node = CssCompressor("css", css)
++        self.assertIn(CssRelativeFilter, css_node.cached_filters)
++        self.assertIn(UpperCaseCSSFilter, css_node.cached_filters)
++
++    def test_js_filter_registered_and_works(self):
++        from compressor.js import JsCompressor
++        from compressor.filters import _registered_filters, register_filter, FilterBase
++
++        @register_filter("js")
++        class UpperCaseJSFilter(FilterBase):
++            def output(self, **kwargs):
++                return self.content.upper()
++
++        js = '<script type="text/javascript">var x = 1;</script>'
++        js_node = JsCompressor("js", js)
++        self.assertIn(UpperCaseJSFilter, js_node.cached_filters)
++        output = js_node.filter_output("var x = 1;")
++        self.assertEqual(output, "VAR X = 1;")

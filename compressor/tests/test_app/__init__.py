@@ -1,0 +1,1 @@
+default_app_config = 'compressor.tests.test_app.apps.TestAppConfig'

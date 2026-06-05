@@ -619,3 +619,160 @@ class SpecializedFiltersTest(TestCase):
         self.assertEqual(
             filter.options, (("binary", str("cleancss")), ("args", str("")))
         )
+
+
+class RegisterFilterDecoratorTestCase(TestCase):
+    def setUp(self):
+        from compressor.filters import _registered_filters
+
+        self._saved_registered = {
+            "css": list(_registered_filters["css"]),
+            "js": list(_registered_filters["js"]),
+        }
+
+    def tearDown(self):
+        from compressor.filters import _registered_filters
+
+        _registered_filters["css"][:] = self._saved_registered["css"]
+        _registered_filters["js"][:] = self._saved_registered["js"]
+
+    def test_decorator_registers_class(self):
+        from compressor.filters import _registered_filters, register_filter, FilterBase
+
+        @register_filter("css")
+        class MyTestCSSFilter(FilterBase):
+            def output(self, **kwargs):
+                return self.content.upper()
+
+        self.assertIn(MyTestCSSFilter, _registered_filters["css"])
+        self.assertEqual(MyTestCSSFilter._compressor_filter_type, "css")
+        self.assertEqual(MyTestCSSFilter._compressor_filter_name, "MyTestCSSFilter")
+
+    def test_decorator_with_custom_name(self):
+        from compressor.filters import _registered_filters, register_filter, FilterBase
+
+        @register_filter("js", name="my_custom_js")
+        class MyTestJSFilter(FilterBase):
+            def output(self, **kwargs):
+                return self.content.upper()
+
+        self.assertIn(MyTestJSFilter, _registered_filters["js"])
+        self.assertEqual(MyTestJSFilter._compressor_filter_type, "js")
+        self.assertEqual(MyTestJSFilter._compressor_filter_name, "my_custom_js")
+
+    def test_decorator_duplicate_registration(self):
+        from compressor.filters import _registered_filters, register_filter, FilterBase
+
+        @register_filter("css")
+        class DuplicateFilter(FilterBase):
+            def output(self, **kwargs):
+                return self.content
+
+        @register_filter("css")
+        class DuplicateFilter(FilterBase):
+            def output(self, **kwargs):
+                return self.content
+
+        count = len(
+            [f for f in _registered_filters["css"] if f is DuplicateFilter]
+        )
+        self.assertEqual(count, 1)
+
+    def test_invalid_filter_type(self):
+        from compressor.filters import register_filter, FilterBase
+
+        with self.assertRaises(ValueError):
+
+            @register_filter("invalid")
+            class BadFilter(FilterBase):
+                pass
+
+    def test_auto_discovery_imports_test_app_filters(self):
+        from compressor.filters import _registered_filters
+        from importlib import import_module
+
+        import_module("compressor.tests.test_app.filters")
+
+        registered_names = [
+            f._compressor_filter_name
+            for f in _registered_filters["css"]
+        ]
+        self.assertIn("UpperCaseCSSFilter", registered_names)
+
+        registered_names_js = [
+            f._compressor_filter_name
+            for f in _registered_filters["js"]
+        ]
+        self.assertIn("upper_js", registered_names_js)
+
+    @override_settings(
+        COMPRESS_ENABLED=True,
+        COMPRESS_FILTERS={"css": []},
+    )
+    def test_registered_filter_merged_into_compressor(self):
+        from compressor.css import CssCompressor
+        from compressor.filters import _registered_filters, register_filter, FilterBase
+
+        @register_filter("css")
+        class UpperCaseCSSFilter(FilterBase):
+            def output(self, **kwargs):
+                return self.content.upper()
+
+        css = '<style type="text/css">p { color: red; }</style>'
+        css_node = CssCompressor("css", css)
+        self.assertIn(UpperCaseCSSFilter, css_node.cached_filters)
+        output = css_node.filter_output("p { color: red; }")
+        self.assertEqual(output, "P { COLOR: RED; }")
+
+    @override_settings(
+        COMPRESS_ENABLED=True,
+        COMPRESS_FILTERS={"css": ["compressor.filters.css_default.CssAbsoluteFilter"]},
+    )
+    def test_registered_filter_appended_with_existing_filters(self):
+        from compressor.css import CssCompressor
+        from compressor.filters import _registered_filters, register_filter, FilterBase
+        from compressor.filters.css_default import CssAbsoluteFilter
+
+        @register_filter("css")
+        class UpperCaseCSSFilter(FilterBase):
+            def output(self, **kwargs):
+                return self.content.upper()
+
+        css = '<style type="text/css">p { color: red; }</style>'
+        css_node = CssCompressor("css", css)
+        self.assertIn(CssAbsoluteFilter, css_node.cached_filters)
+        self.assertIn(UpperCaseCSSFilter, css_node.cached_filters)
+
+    @override_settings(
+        COMPRESS_ENABLED=True,
+        COMPRESS_FILTERS={"css": ["compressor.filters.css_default.CssRelativeFilter"]},
+    )
+    def test_explicit_filters_not_overridden(self):
+        from compressor.css import CssCompressor
+        from compressor.filters import _registered_filters, register_filter, FilterBase
+        from compressor.filters.css_default import CssRelativeFilter
+
+        @register_filter("css")
+        class UpperCaseCSSFilter(FilterBase):
+            def output(self, **kwargs):
+                return self.content.upper()
+
+        css = '<style type="text/css">p { color: red; }</style>'
+        css_node = CssCompressor("css", css)
+        self.assertIn(CssRelativeFilter, css_node.cached_filters)
+        self.assertIn(UpperCaseCSSFilter, css_node.cached_filters)
+
+    def test_js_filter_registered_and_works(self):
+        from compressor.js import JsCompressor
+        from compressor.filters import _registered_filters, register_filter, FilterBase
+
+        @register_filter("js")
+        class UpperCaseJSFilter(FilterBase):
+            def output(self, **kwargs):
+                return self.content.upper()
+
+        js = '<script type="text/javascript">var x = 1;</script>'
+        js_node = JsCompressor("js", js)
+        self.assertIn(UpperCaseJSFilter, js_node.cached_filters)
+        output = js_node.filter_output("var x = 1;")
+        self.assertEqual(output, "VAR X = 1;")

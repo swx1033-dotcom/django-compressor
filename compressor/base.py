@@ -17,7 +17,7 @@ from compressor.exceptions import (
     UncompressableFileError,
     FilterDoesNotExist,
 )
-from compressor.filters import CachedCompilerFilter
+from compressor.filters import CachedCompilerFilter, get_registered_filters
 from compressor.storage import compressor_file_storage
 from compressor.signals import post_compress
 from compressor.utils import get_class, get_mod_func, staticfiles
@@ -48,7 +48,24 @@ class Compressor:
         **kwargs
     ):
         if filters is None:
-            self.filters = settings.COMPRESS_FILTERS[resource_kind]
+            self.filters = list(settings.COMPRESS_FILTERS[resource_kind])
+            registered = get_registered_filters().get(resource_kind, [])
+            if registered:
+                existing_paths = set()
+                for f in self.filters:
+                    if isinstance(f, str):
+                        existing_paths.add(f)
+                    elif hasattr(f, "__module__") and hasattr(f, "__qualname__"):
+                        existing_paths.add(
+                            f.__module__ + "." + f.__qualname__
+                        )
+                for reg_cls in registered:
+                    reg_path = (
+                        reg_cls.__module__ + "." + reg_cls.__qualname__
+                    )
+                    if reg_path not in existing_paths:
+                        self.filters.append(reg_cls)
+                        existing_paths.add(reg_path)
         else:
             self.filters = filters
         if output_prefix is None:
