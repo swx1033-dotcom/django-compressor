@@ -56,6 +56,7 @@ class CompressorConf(AppConf):
     CLEAN_CSS_BINARY = "cleancss"
     CLEAN_CSS_ARGUMENTS = ""
     DATA_URI_MAX_SIZE = 1024
+    PARALLEL_WORKERS = os.cpu_count() or 1
 
     # Subresource Integrity (SRI) settings for compiled assets.
     # Example: COMPRESS_SRI_HASHES = ("sha256", "sha384")
@@ -151,6 +152,19 @@ class CompressorConf(AppConf):
                 "The COMPRESS_PRECOMPILERS setting "
                 "must be a list or tuple. Check for "
                 "missing commas."
+            )
+        return value
+
+    def configure_parallel_workers(self, value):
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            raise ImproperlyConfigured(
+                "The COMPRESS_PARALLEL_WORKERS setting must be an integer."
+            )
+        if value < 1:
+            raise ImproperlyConfigured(
+                "The COMPRESS_PARALLEL_WORKERS setting must be greater than 0."
             )
         return value
 

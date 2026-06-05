@@ -33,6 +33,22 @@ class ConfTestCase(SimpleTestCase):
         self.assertEqual(conf.FILTERS["css"], ["ham"])
         self.assertEqual(conf.FILTERS["js"], ["spam"])
 
+    def test_parallel_workers_default(self):
+        conf = create_conf()
+        self.assertGreaterEqual(conf.PARALLEL_WORKERS, 1)
+
+    @override_settings(COMPRESS_PARALLEL_WORKERS="4")
+    def test_parallel_workers_normalized(self):
+        conf = create_conf()
+        self.assertEqual(conf.PARALLEL_WORKERS, 4)
+
+    @override_settings(COMPRESS_PARALLEL_WORKERS=0)
+    def test_parallel_workers_invalid(self):
+        with self.assertRaisesMessage(
+            Exception, "COMPRESS_PARALLEL_WORKERS setting must be greater than 0"
+        ):
+            create_conf()
+
     def test_sri_hashes_defaults(self):
         conf = create_conf()
         self.assertEqual(conf.SRI_HASHES, ())
