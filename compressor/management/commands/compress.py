@@ -213,6 +213,11 @@ class Command(BaseCommand):
             contexts = [contexts]
 
         parser = self.__get_parser(engine)
+        offline_compressor = None
+        if engine == "django":
+            from compressor.offline.django import OfflineCompressor
+
+            offline_compressor = OfflineCompressor()
         fine_templates = []
 
         if verbosity >= 1:
@@ -286,6 +291,7 @@ class Command(BaseCommand):
                     parser,
                     template,
                     errors,
+                    offline_compressor,
                 )
 
             pool.shutdown(wait=True)
@@ -306,10 +312,16 @@ class Command(BaseCommand):
                 "done\nCompressed %d block(s) from %d template(s) for %d context(s).\n"
                 % (len(offline_manifest), nodes_count, contexts_count)
             )
-        return offline_manifest, len(offline_manifest), offline_manifest.values()
+        rendered_results = [
+            entry["html"] if isinstance(entry, dict) else entry
+            for entry in offline_manifest.values()
+        ]
+        return offline_manifest, len(offline_manifest), rendered_results
 
     @staticmethod
-    def _compress_template(offline_manifest, nodes, parser, template, errors):
+    def _compress_template(
+        offline_manifest, nodes, parser, template, errors, offline_compressor=None
+    ):
         for node, node_contexts in nodes.items():
             for context in node_contexts:
                 context.push()
@@ -337,7 +349,10 @@ class Command(BaseCommand):
 
                 try:
                     with node_lock:
-                        result = parser.render_node(template, context, node)
+                        if offline_compressor is not None:
+                            result = offline_compressor.compress(template, context, node)
+                        else:
+                            result = parser.render_node(template, context, node)
                 except Exception as e:
                     errors.append(
                         CommandError(
@@ -350,10 +365,13 @@ class Command(BaseCommand):
                 finally:
                     with node_locks_lock:
                         node_locks.pop(node_id, None)
-                result = result.replace(
-                    settings.COMPRESS_URL, settings.COMPRESS_URL_PLACEHOLDER
-                )
-                offline_manifest[key] = result
+                if isinstance(result, dict):
+                    offline_manifest[key] = result
+                else:
+                    result = result.replace(
+                        str(settings.COMPRESS_URL), settings.COMPRESS_URL_PLACEHOLDER
+                    )
+                    offline_manifest[key] = result
                 context.pop()
 
     def handle_extensions(self, extensions=("html",)):

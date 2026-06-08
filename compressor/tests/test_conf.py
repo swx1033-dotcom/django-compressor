@@ -1,7 +1,8 @@
 from django.test import SimpleTestCase
 from django.test.utils import override_settings
-from compressor.conf import settings
+
 from compressor.conf import CompressorConf
+from compressor.conf import settings
 
 
 default_css_filters = [
@@ -51,6 +52,22 @@ class ConfTestCase(SimpleTestCase):
     def test_sri_hashes_invalid(self):
         with self.assertRaisesMessage(
             Exception, "COMPRESS_SRI_HASHES setting only supports"
+        ):
+            create_conf()
+
+    def test_sri_hash_algorithm_default(self):
+        conf = create_conf()
+        self.assertEqual(conf.SRI_HASH_ALGORITHM, "sha384")
+
+    @override_settings(COMPRESS_SRI_HASH_ALGORITHM="SHA512")
+    def test_sri_hash_algorithm_normalized(self):
+        conf = create_conf()
+        self.assertEqual(conf.SRI_HASH_ALGORITHM, "sha512")
+
+    @override_settings(COMPRESS_SRI_HASH_ALGORITHM="md5")
+    def test_sri_hash_algorithm_invalid(self):
+        with self.assertRaisesMessage(
+            Exception, "COMPRESS_SRI_HASH_ALGORITHM setting only supports"
         ):
             create_conf()
 

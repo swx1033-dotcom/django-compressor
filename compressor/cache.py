@@ -83,6 +83,15 @@ def get_offline_manifest():
     return _offline_manifest
 
 
+def get_offline_manifest_entry(key, manifest=None):
+    if manifest is None:
+        manifest = get_offline_manifest()
+    entry = manifest[key]
+    if isinstance(entry, dict):
+        return entry
+    return {"html": entry, "sri_hash": ""}
+
+
 def flush_offline_manifest():
     global _offline_manifest
     _offline_manifest = None

@@ -60,6 +60,8 @@ class CompressorConf(AppConf):
     # Subresource Integrity (SRI) settings for compiled assets.
     # Example: COMPRESS_SRI_HASHES = ("sha256", "sha384")
     SRI_HASHES = ()
+    # Example: COMPRESS_SRI_HASH_ALGORITHM = "sha384"
+    SRI_HASH_ALGORITHM = "sha384"
     # Example: COMPRESS_SRI_CROSSORIGIN = "anonymous"
     SRI_CROSSORIGIN = None
 
@@ -174,6 +176,16 @@ class CompressorConf(AppConf):
                 )
             normalized.append(algo)
         return tuple(normalized)
+
+    def configure_sri_hash_algorithm(self, value):
+        allowed = {"sha256", "sha384", "sha512"}
+        algorithm = str(value or "sha384").lower()
+        if algorithm not in allowed:
+            raise ImproperlyConfigured(
+                "The COMPRESS_SRI_HASH_ALGORITHM setting only supports %s."
+                % ", ".join(sorted(allowed))
+            )
+        return algorithm
 
     def configure_sri_crossorigin(self, value):
         if value in (None, ""):

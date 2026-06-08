@@ -1,0 +1,418 @@
+diff --git a/compressor/base.py b/compressor/base.py
+index 280c16a..f4c7905 100644
+--- a/compressor/base.py
++++ b/compressor/base.py
+@@ -238,12 +238,17 @@ class Compressor:
+ 
+     @cached_property
+     def cachekey(self):
++        sri_hash_algorithm = (
++            settings.COMPRESS_SRI_HASH_ALGORITHM
++            if settings.is_overridden("COMPRESS_SRI_HASH_ALGORITHM")
++            else ""
++        )
+         return get_hexdigest(
+             "".join(
+                 [self.content]
+                 + self.mtimes
+                 + list(settings.COMPRESS_SRI_HASHES)
+-                + [settings.COMPRESS_SRI_CROSSORIGIN or ""]
++                + [sri_hash_algorithm, settings.COMPRESS_SRI_CROSSORIGIN or ""]
+             ).encode(self.charset),
+             12,
+         )
+@@ -366,7 +371,7 @@ class Compressor:
+                 pass
+         return content
+ 
+-    def output(self, mode="file", forced=False, basename=None):
++    def output(self, mode="file", forced=False, basename=None, generate_sri=True):
+         """
+         The general output method, override in subclass if you need to do
+         any custom modification. Calls other mode specific methods or simply
+@@ -379,19 +384,35 @@ class Compressor:
+ 
+         if settings.COMPRESS_ENABLED or forced:
+             filtered_output = self.filter_output(output)
+-            return self.handle_output(mode, filtered_output, forced, basename)
++            return self.handle_output(
++                mode,
++                filtered_output,
++                forced,
++                basename,
++                generate_sri=generate_sri,
++            )
+ 
+         return output
+ 
+-    def handle_output(self, mode, content, forced, basename=None):
++    def handle_output(
++        self, mode, content, forced, basename=None, generate_sri=True
++    ):
+         # Then check for the appropriate output method and call it
+         output_func = getattr(self, "output_%s" % mode, None)
+         if callable(output_func):
+-            return output_func(mode, content, forced, basename)
++            return output_func(
++                mode,
++                content,
++                forced,
++                basename,
++                generate_sri=generate_sri,
++            )
+         # Total failure, raise a general exception
+         raise CompressorError("Couldn't find output method for mode '%s'" % mode)
+ 
+-    def output_file(self, mode, content, forced=False, basename=None):
++    def output_file(
++        self, mode, content, forced=False, basename=None, generate_sri=True
++    ):
+         """
+         The output method that saves the content to a file and renders
+         the appropriate template with the file's URL.
+@@ -401,27 +422,38 @@ class Compressor:
+             self.storage.save(new_filepath, ContentFile(content.encode(self.charset)))
+         url = mark_safe(self.storage.url(new_filepath))
+         context = {"url": url}
+-        integrity = self.get_integrity(content)
+-        if integrity:
+-            context["integrity"] = integrity
+-            crossorigin = settings.COMPRESS_SRI_CROSSORIGIN
+-            if crossorigin:
+-                context["crossorigin"] = crossorigin
++        if generate_sri:
++            integrity = self.get_integrity(content)
++            if integrity:
++                context["integrity"] = integrity
++                crossorigin = settings.COMPRESS_SRI_CROSSORIGIN
++                if crossorigin:
++                    context["crossorigin"] = crossorigin
+         return self.render_output(mode, context)
+ 
+-    def output_inline(self, mode, content, forced=False, basename=None):
++    def output_inline(
++        self, mode, content, forced=False, basename=None, generate_sri=True
++    ):
+         """
+         The output method that directly returns the content for inline
+         display.
+         """
+         return self.render_output(mode, {"content": content})
+ 
+-    def output_preload(self, mode, content, forced=False, basename=None):
++    def output_preload(
++        self, mode, content, forced=False, basename=None, generate_sri=True
++    ):
+         """
+         The output method that returns <link> with rel="preload" and
+         proper href attribute for given file.
+         """
+-        return self.output_file(mode, content, forced, basename)
++        return self.output_file(
++            mode,
++            content,
++            forced,
++            basename,
++            generate_sri=generate_sri,
++        )
+ 
+     def render_output(self, mode, context=None):
+         """
+@@ -451,17 +483,37 @@ class Compressor:
+         template_name = self.get_template_name(mode)
+         return render_to_string(template_name, context=final_context)
+ 
++    def should_generate_sri(self):
++        return bool(settings.COMPRESS_SRI_HASHES) or settings.is_overridden(
++            "COMPRESS_SRI_HASH_ALGORITHM"
++        )
++
++    def get_sri_hash(self, content, algorithm=None):
++        if not self.should_generate_sri():
++            return ""
++        if algorithm is None:
++            if settings.is_overridden("COMPRESS_SRI_HASH_ALGORITHM"):
++                algorithm = settings.COMPRESS_SRI_HASH_ALGORITHM
++            elif settings.COMPRESS_SRI_HASHES:
++                algorithm = settings.COMPRESS_SRI_HASHES[0]
++            else:
++                algorithm = settings.COMPRESS_SRI_HASH_ALGORITHM
++        if not algorithm:
++            return ""
++        content_bytes = content.encode(self.charset)
++        digest = hashlib.new(algorithm, content_bytes).digest()
++        encoded = base64.b64encode(digest).decode("ascii")
++        return "%s-%s" % (algorithm, encoded)
++
+     def get_integrity(self, content):
+         """
+         Returns the Subresource Integrity (SRI) string for the given content.
+         """
+         hashes = settings.COMPRESS_SRI_HASHES
+-        if not hashes:
+-            return ""
+-        content_bytes = content.encode(self.charset)
+-        integrity_parts = []
+-        for algo in hashes:
+-            digest = hashlib.new(algo, content_bytes).digest()
+-            encoded = base64.b64encode(digest).decode("ascii")
+-            integrity_parts.append("%s-%s" % (algo, encoded))
+-        return " ".join(integrity_parts)
++        if hashes:
++            return " ".join(
++                self.get_sri_hash(content, algorithm=algo) for algo in hashes
++            )
++        if settings.is_overridden("COMPRESS_SRI_HASH_ALGORITHM"):
++            return self.get_sri_hash(content)
++        return ""
+diff --git a/compressor/cache.py b/compressor/cache.py
+index c5dabbf..a6b3286 100644
+--- a/compressor/cache.py
++++ b/compressor/cache.py
+@@ -83,6 +83,15 @@ def get_offline_manifest():
+     return _offline_manifest
+ 
+ 
++def get_offline_manifest_entry(key, manifest=None):
++    if manifest is None:
++        manifest = get_offline_manifest()
++    entry = manifest[key]
++    if isinstance(entry, dict):
++        return entry
++    return {"html": entry, "sri_hash": ""}
++
++
+ def flush_offline_manifest():
+     global _offline_manifest
+     _offline_manifest = None
+diff --git a/compressor/conf.py b/compressor/conf.py
+index 6b90dbc..174e4df 100644
+--- a/compressor/conf.py
++++ b/compressor/conf.py
+@@ -60,6 +60,8 @@ class CompressorConf(AppConf):
+     # Subresource Integrity (SRI) settings for compiled assets.
+     # Example: COMPRESS_SRI_HASHES = ("sha256", "sha384")
+     SRI_HASHES = ()
++    # Example: COMPRESS_SRI_HASH_ALGORITHM = "sha384"
++    SRI_HASH_ALGORITHM = "sha384"
+     # Example: COMPRESS_SRI_CROSSORIGIN = "anonymous"
+     SRI_CROSSORIGIN = None
+ 
+@@ -175,6 +177,16 @@ class CompressorConf(AppConf):
+             normalized.append(algo)
+         return tuple(normalized)
+ 
++    def configure_sri_hash_algorithm(self, value):
++        allowed = {"sha256", "sha384", "sha512"}
++        algorithm = str(value or "sha384").lower()
++        if algorithm not in allowed:
++            raise ImproperlyConfigured(
++                "The COMPRESS_SRI_HASH_ALGORITHM setting only supports %s."
++                % ", ".join(sorted(allowed))
++            )
++        return algorithm
++
+     def configure_sri_crossorigin(self, value):
+         if value in (None, ""):
+             return None
+diff --git a/compressor/management/commands/compress.py b/compressor/management/commands/compress.py
+index bcf6cf6..e6bd135 100644
+--- a/compressor/management/commands/compress.py
++++ b/compressor/management/commands/compress.py
+@@ -213,6 +213,11 @@ class Command(BaseCommand):
+             contexts = [contexts]
+ 
+         parser = self.__get_parser(engine)
++        offline_compressor = None
++        if engine == "django":
++            from compressor.offline.django import OfflineCompressor
++
++            offline_compressor = OfflineCompressor()
+         fine_templates = []
+ 
+         if verbosity >= 1:
+@@ -286,6 +291,7 @@ class Command(BaseCommand):
+                     parser,
+                     template,
+                     errors,
++                    offline_compressor,
+                 )
+ 
+             pool.shutdown(wait=True)
+@@ -306,10 +312,16 @@ class Command(BaseCommand):
+                 "done\nCompressed %d block(s) from %d template(s) for %d context(s).\n"
+                 % (len(offline_manifest), nodes_count, contexts_count)
+             )
+-        return offline_manifest, len(offline_manifest), offline_manifest.values()
++        rendered_results = [
++            entry["html"] if isinstance(entry, dict) else entry
++            for entry in offline_manifest.values()
++        ]
++        return offline_manifest, len(offline_manifest), rendered_results
+ 
+     @staticmethod
+-    def _compress_template(offline_manifest, nodes, parser, template, errors):
++    def _compress_template(
++        offline_manifest, nodes, parser, template, errors, offline_compressor=None
++    ):
+         for node, node_contexts in nodes.items():
+             for context in node_contexts:
+                 context.push()
+@@ -337,7 +349,10 @@ class Command(BaseCommand):
+ 
+                 try:
+                     with node_lock:
+-                        result = parser.render_node(template, context, node)
++                        if offline_compressor is not None:
++                            result = offline_compressor.compress(template, context, node)
++                        else:
++                            result = parser.render_node(template, context, node)
+                 except Exception as e:
+                     errors.append(
+                         CommandError(
+@@ -350,10 +365,13 @@ class Command(BaseCommand):
+                 finally:
+                     with node_locks_lock:
+                         node_locks.pop(node_id, None)
+-                result = result.replace(
+-                    settings.COMPRESS_URL, settings.COMPRESS_URL_PLACEHOLDER
+-                )
+-                offline_manifest[key] = result
++                if isinstance(result, dict):
++                    offline_manifest[key] = result
++                else:
++                    result = result.replace(
++                        str(settings.COMPRESS_URL), settings.COMPRESS_URL_PLACEHOLDER
++                    )
++                    offline_manifest[key] = result
+                 context.pop()
+ 
+     def handle_extensions(self, extensions=("html",)):
+diff --git a/compressor/offline/django.py b/compressor/offline/django.py
+index 619c130..4994678 100644
+--- a/compressor/offline/django.py
++++ b/compressor/offline/django.py
+@@ -15,6 +15,37 @@ from django.template.loader_tags import (
+ 
+ from compressor.exceptions import TemplateSyntaxError, TemplateDoesNotExist
+ from compressor.templatetags.compress import CompressorNode
++from compressor.conf import settings
++
++
++class OfflineCompressor:
++    def compress(self, template, context, node):
++        name = node.name or getattr(node, "name", None)
++        context["compressed"] = {"name": name}
++        log = getattr(template, "_log", None)
++        verbosity = getattr(template, "_log_verbosity", 0)
++        compressor = node.get_compressor(context, node.kind, log, verbosity)
++        file_basename = name or getattr(node, "basename", None) or "output"
++        output = "\n".join(compressor.filter_input(forced=True))
++        if not output:
++            return ""
++        filtered_output = compressor.filter_output(output)
++        rendered_output = compressor.handle_output(
++            node.mode,
++            filtered_output,
++            forced=True,
++            basename=file_basename,
++            generate_sri=False,
++        )
++        rendered_output = rendered_output.replace(
++            str(settings.COMPRESS_URL), settings.COMPRESS_URL_PLACEHOLDER
++        )
++        sri_hash = ""
++        if node.mode in ("file", "preload"):
++            sri_hash = compressor.get_sri_hash(filtered_output)
++        if sri_hash:
++            return {"html": rendered_output, "sri_hash": sri_hash}
++        return rendered_output
+ 
+ 
+ def handle_extendsnode(extendsnode, context):
+diff --git a/compressor/templatetags/compress.py b/compressor/templatetags/compress.py
+index 57bce48..0a01d5c 100644
+--- a/compressor/templatetags/compress.py
++++ b/compressor/templatetags/compress.py
+@@ -6,6 +6,7 @@ from compressor.cache import (
+     cache_set,
+     get_offline_hexdigest,
+     get_offline_manifest,
++    get_offline_manifest_entry,
+     get_templatetag_cachekey,
+ )
+ from compressor.conf import settings
+@@ -63,6 +64,16 @@ class CompressorMixin:
+         """
+         return (settings.COMPRESS_ENABLED and settings.COMPRESS_OFFLINE) or forced
+ 
++    def add_sri_attributes(self, rendered_output, sri_hash):
++        if not sri_hash or "integrity=" in rendered_output:
++            return rendered_output
++        attributes = ' integrity="%s"' % sri_hash
++        crossorigin = settings.COMPRESS_SRI_CROSSORIGIN
++        if crossorigin and "crossorigin=" not in rendered_output:
++            attributes += ' crossorigin="%s"' % crossorigin
++        closing = "/>" if "/>" in rendered_output else ">"
++        return rendered_output.replace(closing, "%s%s" % (attributes, closing), 1)
++
+     def render_offline(self, context):
+         """
+         If enabled and in offline mode, and not forced check the offline cache
+@@ -72,7 +83,8 @@ class CompressorMixin:
+         key = get_offline_hexdigest(original_content)
+         offline_manifest = get_offline_manifest()
+         if key in offline_manifest:
+-            return offline_manifest[key].replace(
++            offline_entry = get_offline_manifest_entry(key, offline_manifest)
++            rendered_output = offline_entry["html"].replace(
+                 settings.COMPRESS_URL_PLACEHOLDER,
+                 # Cast ``settings.COMPRESS_URL`` to a string to allow it to be
+                 # a string-alike object to e.g. add ``SCRIPT_NAME`` WSGI param
+@@ -80,6 +92,9 @@ class CompressorMixin:
+                 # See https://code.djangoproject.com/ticket/25598.
+                 str(settings.COMPRESS_URL),
+             )
++            return self.add_sri_attributes(
++                rendered_output, offline_entry.get("sri_hash", "")
++            )
+         else:
+             raise OfflineGenerationError(
+                 "You have offline compression "
+diff --git a/compressor/tests/test_conf.py b/compressor/tests/test_conf.py
+index 443fe75..1372494 100644
+--- a/compressor/tests/test_conf.py
++++ b/compressor/tests/test_conf.py
+@@ -1,7 +1,8 @@
+ from django.test import SimpleTestCase
+ from django.test.utils import override_settings
+-from compressor.conf import settings
++
+ from compressor.conf import CompressorConf
++from compressor.conf import settings
+ 
+ 
+ default_css_filters = [
+@@ -54,6 +55,22 @@ class ConfTestCase(SimpleTestCase):
+         ):
+             create_conf()
+ 
++    def test_sri_hash_algorithm_default(self):
++        conf = create_conf()
++        self.assertEqual(conf.SRI_HASH_ALGORITHM, "sha384")
++
++    @override_settings(COMPRESS_SRI_HASH_ALGORITHM="SHA512")
++    def test_sri_hash_algorithm_normalized(self):
++        conf = create_conf()
++        self.assertEqual(conf.SRI_HASH_ALGORITHM, "sha512")
++
++    @override_settings(COMPRESS_SRI_HASH_ALGORITHM="md5")
++    def test_sri_hash_algorithm_invalid(self):
++        with self.assertRaisesMessage(
++            Exception, "COMPRESS_SRI_HASH_ALGORITHM setting only supports"
++        ):
++            create_conf()
++
+     @override_settings(COMPRESS_SRI_CROSSORIGIN="anonymous")
+     def test_sri_crossorigin(self):
+         conf = create_conf()

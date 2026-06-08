@@ -238,12 +238,17 @@ class Compressor:
 
     @cached_property
     def cachekey(self):
+        sri_hash_algorithm = (
+            settings.COMPRESS_SRI_HASH_ALGORITHM
+            if settings.is_overridden("COMPRESS_SRI_HASH_ALGORITHM")
+            else ""
+        )
         return get_hexdigest(
             "".join(
                 [self.content]
                 + self.mtimes
                 + list(settings.COMPRESS_SRI_HASHES)
-                + [settings.COMPRESS_SRI_CROSSORIGIN or ""]
+                + [sri_hash_algorithm, settings.COMPRESS_SRI_CROSSORIGIN or ""]
             ).encode(self.charset),
             12,
         )
@@ -366,7 +371,7 @@ class Compressor:
                 pass
         return content
 
-    def output(self, mode="file", forced=False, basename=None):
+    def output(self, mode="file", forced=False, basename=None, generate_sri=True):
         """
         The general output method, override in subclass if you need to do
         any custom modification. Calls other mode specific methods or simply
@@ -379,19 +384,35 @@ class Compressor:
 
         if settings.COMPRESS_ENABLED or forced:
             filtered_output = self.filter_output(output)
-            return self.handle_output(mode, filtered_output, forced, basename)
+            return self.handle_output(
+                mode,
+                filtered_output,
+                forced,
+                basename,
+                generate_sri=generate_sri,
+            )
 
         return output
 
-    def handle_output(self, mode, content, forced, basename=None):
+    def handle_output(
+        self, mode, content, forced, basename=None, generate_sri=True
+    ):
         # Then check for the appropriate output method and call it
         output_func = getattr(self, "output_%s" % mode, None)
         if callable(output_func):
-            return output_func(mode, content, forced, basename)
+            return output_func(
+                mode,
+                content,
+                forced,
+                basename,
+                generate_sri=generate_sri,
+            )
         # Total failure, raise a general exception
         raise CompressorError("Couldn't find output method for mode '%s'" % mode)
 
-    def output_file(self, mode, content, forced=False, basename=None):
+    def output_file(
+        self, mode, content, forced=False, basename=None, generate_sri=True
+    ):
         """
         The output method that saves the content to a file and renders
         the appropriate template with the file's URL.
@@ -401,27 +422,38 @@ class Compressor:
             self.storage.save(new_filepath, ContentFile(content.encode(self.charset)))
         url = mark_safe(self.storage.url(new_filepath))
         context = {"url": url}
-        integrity = self.get_integrity(content)
-        if integrity:
-            context["integrity"] = integrity
-            crossorigin = settings.COMPRESS_SRI_CROSSORIGIN
-            if crossorigin:
-                context["crossorigin"] = crossorigin
+        if generate_sri:
+            integrity = self.get_integrity(content)
+            if integrity:
+                context["integrity"] = integrity
+                crossorigin = settings.COMPRESS_SRI_CROSSORIGIN
+                if crossorigin:
+                    context["crossorigin"] = crossorigin
         return self.render_output(mode, context)
 
-    def output_inline(self, mode, content, forced=False, basename=None):
+    def output_inline(
+        self, mode, content, forced=False, basename=None, generate_sri=True
+    ):
         """
         The output method that directly returns the content for inline
         display.
         """
         return self.render_output(mode, {"content": content})
 
-    def output_preload(self, mode, content, forced=False, basename=None):
+    def output_preload(
+        self, mode, content, forced=False, basename=None, generate_sri=True
+    ):
         """
         The output method that returns <link> with rel="preload" and
         proper href attribute for given file.
         """
-        return self.output_file(mode, content, forced, basename)
+        return self.output_file(
+            mode,
+            content,
+            forced,
+            basename,
+            generate_sri=generate_sri,
+        )
 
     def render_output(self, mode, context=None):
         """
@@ -451,17 +483,37 @@ class Compressor:
         template_name = self.get_template_name(mode)
         return render_to_string(template_name, context=final_context)
 
+    def should_generate_sri(self):
+        return bool(settings.COMPRESS_SRI_HASHES) or settings.is_overridden(
+            "COMPRESS_SRI_HASH_ALGORITHM"
+        )
+
+    def get_sri_hash(self, content, algorithm=None):
+        if not self.should_generate_sri():
+            return ""
+        if algorithm is None:
+            if settings.is_overridden("COMPRESS_SRI_HASH_ALGORITHM"):
+                algorithm = settings.COMPRESS_SRI_HASH_ALGORITHM
+            elif settings.COMPRESS_SRI_HASHES:
+                algorithm = settings.COMPRESS_SRI_HASHES[0]
+            else:
+                algorithm = settings.COMPRESS_SRI_HASH_ALGORITHM
+        if not algorithm:
+            return ""
+        content_bytes = content.encode(self.charset)
+        digest = hashlib.new(algorithm, content_bytes).digest()
+        encoded = base64.b64encode(digest).decode("ascii")
+        return "%s-%s" % (algorithm, encoded)
+
     def get_integrity(self, content):
         """
         Returns the Subresource Integrity (SRI) string for the given content.
         """
         hashes = settings.COMPRESS_SRI_HASHES
-        if not hashes:
-            return ""
-        content_bytes = content.encode(self.charset)
-        integrity_parts = []
-        for algo in hashes:
-            digest = hashlib.new(algo, content_bytes).digest()
-            encoded = base64.b64encode(digest).decode("ascii")
-            integrity_parts.append("%s-%s" % (algo, encoded))
-        return " ".join(integrity_parts)
+        if hashes:
+            return " ".join(
+                self.get_sri_hash(content, algorithm=algo) for algo in hashes
+            )
+        if settings.is_overridden("COMPRESS_SRI_HASH_ALGORITHM"):
+            return self.get_sri_hash(content)
+        return ""

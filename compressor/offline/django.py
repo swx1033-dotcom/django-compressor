@@ -15,6 +15,37 @@ from django.template.loader_tags import (
 
 from compressor.exceptions import TemplateSyntaxError, TemplateDoesNotExist
 from compressor.templatetags.compress import CompressorNode
+from compressor.conf import settings
+
+
+class OfflineCompressor:
+    def compress(self, template, context, node):
+        name = node.name or getattr(node, "name", None)
+        context["compressed"] = {"name": name}
+        log = getattr(template, "_log", None)
+        verbosity = getattr(template, "_log_verbosity", 0)
+        compressor = node.get_compressor(context, node.kind, log, verbosity)
+        file_basename = name or getattr(node, "basename", None) or "output"
+        output = "\n".join(compressor.filter_input(forced=True))
+        if not output:
+            return ""
+        filtered_output = compressor.filter_output(output)
+        rendered_output = compressor.handle_output(
+            node.mode,
+            filtered_output,
+            forced=True,
+            basename=file_basename,
+            generate_sri=False,
+        )
+        rendered_output = rendered_output.replace(
+            str(settings.COMPRESS_URL), settings.COMPRESS_URL_PLACEHOLDER
+        )
+        sri_hash = ""
+        if node.mode in ("file", "preload"):
+            sri_hash = compressor.get_sri_hash(filtered_output)
+        if sri_hash:
+            return {"html": rendered_output, "sri_hash": sri_hash}
+        return rendered_output
 
 
 def handle_extendsnode(extendsnode, context):

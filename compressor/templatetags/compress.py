@@ -6,6 +6,7 @@ from compressor.cache import (
     cache_set,
     get_offline_hexdigest,
     get_offline_manifest,
+    get_offline_manifest_entry,
     get_templatetag_cachekey,
 )
 from compressor.conf import settings
@@ -63,6 +64,16 @@ class CompressorMixin:
         """
         return (settings.COMPRESS_ENABLED and settings.COMPRESS_OFFLINE) or forced
 
+    def add_sri_attributes(self, rendered_output, sri_hash):
+        if not sri_hash or "integrity=" in rendered_output:
+            return rendered_output
+        attributes = ' integrity="%s"' % sri_hash
+        crossorigin = settings.COMPRESS_SRI_CROSSORIGIN
+        if crossorigin and "crossorigin=" not in rendered_output:
+            attributes += ' crossorigin="%s"' % crossorigin
+        closing = "/>" if "/>" in rendered_output else ">"
+        return rendered_output.replace(closing, "%s%s" % (attributes, closing), 1)
+
     def render_offline(self, context):
         """
         If enabled and in offline mode, and not forced check the offline cache
@@ -72,13 +83,17 @@ class CompressorMixin:
         key = get_offline_hexdigest(original_content)
         offline_manifest = get_offline_manifest()
         if key in offline_manifest:
-            return offline_manifest[key].replace(
+            offline_entry = get_offline_manifest_entry(key, offline_manifest)
+            rendered_output = offline_entry["html"].replace(
                 settings.COMPRESS_URL_PLACEHOLDER,
                 # Cast ``settings.COMPRESS_URL`` to a string to allow it to be
                 # a string-alike object to e.g. add ``SCRIPT_NAME`` WSGI param
                 # as a *path prefix* to the output URL.
                 # See https://code.djangoproject.com/ticket/25598.
                 str(settings.COMPRESS_URL),
+            )
+            return self.add_sri_attributes(
+                rendered_output, offline_entry.get("sri_hash", "")
             )
         else:
             raise OfflineGenerationError(
