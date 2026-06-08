@@ -1,5 +1,6 @@
 from django import template
 from django.core.exceptions import ImproperlyConfigured
+import re
 
 from compressor.cache import (
     cache_get,
@@ -72,14 +73,23 @@ class CompressorMixin:
         key = get_offline_hexdigest(original_content)
         offline_manifest = get_offline_manifest()
         if key in offline_manifest:
-            return offline_manifest[key].replace(
+            manifest_entry = offline_manifest[key]
+            if isinstance(manifest_entry, dict):
+                html = manifest_entry.get("html", "")
+                sri_hash = manifest_entry.get("sri_hash", "")
+            else:
+                html = manifest_entry
+                sri_hash = ""
+
+            html = html.replace(
                 settings.COMPRESS_URL_PLACEHOLDER,
-                # Cast ``settings.COMPRESS_URL`` to a string to allow it to be
-                # a string-alike object to e.g. add ``SCRIPT_NAME`` WSGI param
-                # as a *path prefix* to the output URL.
-                # See https://code.djangoproject.com/ticket/25598.
                 str(settings.COMPRESS_URL),
             )
+
+            if sri_hash and settings.COMPRESS_SRI_HASHES:
+                html = self._inject_sri_attributes(html, sri_hash)
+
+            return html
         else:
             raise OfflineGenerationError(
                 "You have offline compression "
@@ -87,6 +97,33 @@ class CompressorMixin:
                 'You may need to run "python manage.py compress". Here '
                 "is the original content:\n\n%s" % (key, original_content)
             )
+
+    def _inject_sri_attributes(self, html, sri_hash):
+        """
+        Inject SRI attributes into script and link tags in the HTML.
+        """
+        def add_sri_to_script(match):
+            tag = match.group(0)
+            if "integrity=" in tag:
+                return tag
+            return tag.replace("<script", '<script integrity="%s"' % sri_hash, 1)
+
+        def add_sri_to_link(match):
+            tag = match.group(0)
+            if "integrity=" in tag:
+                return tag
+            crossorigin = ""
+            if settings.COMPRESS_SRI_CROSSORIGIN:
+                crossorigin = ' crossorigin="%s"' % settings.COMPRESS_SRI_CROSSORIGIN
+            return tag.replace(
+                "<link",
+                '<link integrity="%s"%s' % (sri_hash, crossorigin),
+                1,
+            )
+
+        html = re.sub(r"<script[\s>]", add_sri_to_script, html)
+        html = re.sub(r"<link[\s>]", add_sri_to_link, html)
+        return html
 
     def render_cached(self, compressor, kind, mode):
         """

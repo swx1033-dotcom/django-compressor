@@ -1,6 +1,8 @@
 # flake8: noqa
 import os
 import sys
+import base64
+import hashlib
 import concurrent.futures
 from threading import Lock
 
@@ -353,7 +355,16 @@ class Command(BaseCommand):
                 result = result.replace(
                     settings.COMPRESS_URL, settings.COMPRESS_URL_PLACEHOLDER
                 )
-                offline_manifest[key] = result
+
+                sri_hash = ""
+                if settings.COMPRESS_SRI_HASHES:
+                    algo = settings.COMPRESS_SRI_HASH_ALGORITHM
+                    content_bytes = result.encode("utf-8")
+                    digest = hashlib.new(algo, content_bytes).digest()
+                    encoded = base64.b64encode(digest).decode("ascii")
+                    sri_hash = "%s-%s" % (algo, encoded)
+
+                offline_manifest[key] = {"html": result, "sri_hash": sri_hash}
                 context.pop()
 
     def handle_extensions(self, extensions=("html",)):
