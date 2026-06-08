@@ -37,6 +37,9 @@ class CompressorConf(AppConf):
 
     CSS_HASHING_METHOD = "mtime"
 
+    CSS_URL_CACHE_ENABLED = True
+    CSS_URL_CHECK_ENABLED = True
+
     PRECOMPILERS = (
         # ('text/coffeescript', 'coffee --compile --stdio'),
         # ('text/less', 'lessc {infile} {outfile}'),
