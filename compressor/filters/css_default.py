@@ -18,6 +18,23 @@ URL_PATTERN = re.compile(
     re.VERBOSE,
 )
 SRC_PATTERN = re.compile(r'src=([\'"])(.*?)\1')
+URL_AND_SRC_PATTERN = re.compile(
+    r"""
+    url\(
+    \s*      # any amount of whitespace
+    (?P<url_quote>[\'"]?) # optional quote
+    (?P<url_url>.*?)    # any amount of anything, non-greedily (this is the actual url)
+    (?P=url_quote)       # matching quote (or nothing if there was none)
+    \s*      # any amount of whitespace
+    \)
+    |
+    src=
+    (?P<src_quote>[\'"])  # quote
+    (?P<src_url>.*?)    # url
+    (?P=src_quote)       # matching quote
+    """,
+    re.VERBOSE,
+)
 SCHEMES = ("http://", "https://", "/")
 
 
@@ -31,10 +48,12 @@ class CssAbsoluteFilter(FilterBase):
         self.url = settings.COMPRESS_URL.rstrip("/")
         self.url_path = self.url
         self.has_scheme = False
+        self._url_cache = {}
 
     def input(self, filename=None, basename=None, **kwargs):
         if not filename:
             return self.content
+        self._url_cache = {}
         self.path = basename.replace(os.sep, "/")
         self.path = self.path.lstrip("/")
         if self.url.startswith(("http://", "https://")):
@@ -45,9 +64,7 @@ class CssAbsoluteFilter(FilterBase):
             self.protocol = "%s/" % "/".join(parts[:2])
             self.host = parts[2]
         self.directory_name = "/".join((self.url, os.path.dirname(self.path)))
-        return SRC_PATTERN.sub(
-            self.src_converter, URL_PATTERN.sub(self.url_converter, self.content)
-        )
+        return URL_AND_SRC_PATTERN.sub(self.url_and_src_converter, self.content)
 
     def guess_filename(self, url):
         local_path = url
@@ -65,6 +82,8 @@ class CssAbsoluteFilter(FilterBase):
             local_path = local_path.replace(self.url_path, "", 1)
         # Re-build the local full path by adding root
         filename = os.path.join(self.root, local_path.lstrip("/"))
+        if getattr(settings, "COMPRESS_CSS_ABSOLUTE_FILTER_SKIP_FILE_CHECK", False):
+            return filename
         return os.path.exists(filename) and filename
 
     def add_suffix(self, url):
@@ -98,15 +117,20 @@ class CssAbsoluteFilter(FilterBase):
         return url
 
     def _converter(self, url):
+        if url in self._url_cache:
+            return self._url_cache[url]
         if url.startswith(("#", "data:")):
-            return url
+            result = url
         elif url.startswith(SCHEMES):
-            return self.add_suffix(url)
-        full_url = posixpath.normpath("/".join([str(self.directory_name), url]))
-        if self.has_scheme:
-            full_url = "%s%s" % (self.protocol, full_url)
-        full_url = self.add_suffix(full_url)
-        return self.post_process_url(full_url)
+            result = self.add_suffix(url)
+        else:
+            full_url = posixpath.normpath("/".join([str(self.directory_name), url]))
+            if self.has_scheme:
+                full_url = "%s%s" % (self.protocol, full_url)
+            full_url = self.add_suffix(full_url)
+            result = self.post_process_url(full_url)
+        self._url_cache[url] = result
+        return result
 
     def post_process_url(self, url):
         """
@@ -123,6 +147,18 @@ class CssAbsoluteFilter(FilterBase):
         quote = matchobj.group(1)
         converted_url = self._converter(matchobj.group(2))
         return "src=%s%s%s" % (quote, converted_url, quote)
+
+    def url_and_src_converter(self, matchobj):
+        url_url = matchobj.group("url_url")
+        if url_url is not None:
+            quote = matchobj.group("url_quote")
+            converted_url = self._converter(url_url)
+            return "url(%s%s%s)" % (quote, converted_url, quote)
+        else:
+            quote = matchobj.group("src_quote")
+            url = matchobj.group("src_url")
+            converted_url = self._converter(url)
+            return "src=%s%s%s" % (quote, converted_url, quote)
 
 
 class CssRelativeFilter(CssAbsoluteFilter):
@@ -154,14 +190,20 @@ class CssRelativeFilter(CssAbsoluteFilter):
         old_prefix = self.url
         if self.has_scheme:
             old_prefix = "{}{}".format(self.protocol, old_prefix)
-        # One level up from 'css' / 'js' folder
-        new_prefix = ".."
-        # N levels up from ``settings.COMPRESS_OUTPUT_DIR``
-        new_prefix += "/.." * len(
-            list(
-                filter(
-                    None, os.path.normpath(settings.COMPRESS_OUTPUT_DIR).split(os.sep)
+
+        if getattr(self, '_relative_old_prefix', None) != old_prefix:
+            self._relative_old_prefix = old_prefix
+            # One level up from 'css' / 'js' folder
+            new_prefix = ".."
+            # N levels up from ``settings.COMPRESS_OUTPUT_DIR``
+            new_prefix += "/.." * len(
+                list(
+                    filter(
+                        None, os.path.normpath(settings.COMPRESS_OUTPUT_DIR).split(os.sep)
+                    )
                 )
             )
-        )
-        return re.sub("^{}".format(old_prefix), new_prefix, url)
+            self._relative_regex = re.compile("^{}".format(old_prefix))
+            self._relative_new_prefix = new_prefix
+
+        return self._relative_regex.sub(self._relative_new_prefix, url)

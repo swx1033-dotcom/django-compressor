@@ -36,6 +36,7 @@ class CompressorConf(AppConf):
     }
 
     CSS_HASHING_METHOD = "mtime"
+    CSS_ABSOLUTE_FILTER_SKIP_FILE_CHECK = False
 
     PRECOMPILERS = (
         # ('text/coffeescript', 'coffee --compile --stdio'),
