@@ -366,7 +366,7 @@ class Compressor:
                 pass
         return content
 
-    def output(self, mode="file", forced=False, basename=None):
+    def output(self, mode="file", forced=False, basename=None, generate_sri=False):
         """
         The general output method, override in subclass if you need to do
         any custom modification. Calls other mode specific methods or simply
@@ -377,21 +377,26 @@ class Compressor:
         if not output:
             return ""
 
+        # Generate SRI hash if needed
+        sri_hash = ""
+        if generate_sri:
+            sri_hash = self.get_integrity(output)
+
         if settings.COMPRESS_ENABLED or forced:
             filtered_output = self.filter_output(output)
-            return self.handle_output(mode, filtered_output, forced, basename)
+            return self.handle_output(mode, filtered_output, forced, basename, sri_hash=sri_hash)
 
         return output
 
-    def handle_output(self, mode, content, forced, basename=None):
+    def handle_output(self, mode, content, forced, basename=None, sri_hash=""):
         # Then check for the appropriate output method and call it
         output_func = getattr(self, "output_%s" % mode, None)
         if callable(output_func):
-            return output_func(mode, content, forced, basename)
+            return output_func(mode, content, forced, basename, sri_hash=sri_hash)
         # Total failure, raise a general exception
         raise CompressorError("Couldn't find output method for mode '%s'" % mode)
 
-    def output_file(self, mode, content, forced=False, basename=None):
+    def output_file(self, mode, content, forced=False, basename=None, sri_hash=""):
         """
         The output method that saves the content to a file and renders
         the appropriate template with the file's URL.
@@ -401,27 +406,27 @@ class Compressor:
             self.storage.save(new_filepath, ContentFile(content.encode(self.charset)))
         url = mark_safe(self.storage.url(new_filepath))
         context = {"url": url}
-        integrity = self.get_integrity(content)
+        integrity = sri_hash or self.get_integrity(content)
         if integrity:
             context["integrity"] = integrity
-            crossorigin = settings.COMPRESS_SRI_CROSSORIGIN
-            if crossorigin:
-                context["crossorigin"] = crossorigin
+        crossorigin = settings.COMPRESS_SRI_CROSSORIGIN
+        if crossorigin:
+            context["crossorigin"] = crossorigin
         return self.render_output(mode, context)
 
-    def output_inline(self, mode, content, forced=False, basename=None):
+    def output_inline(self, mode, content, forced=False, basename=None, sri_hash=""):
         """
         The output method that directly returns the content for inline
         display.
         """
         return self.render_output(mode, {"content": content})
 
-    def output_preload(self, mode, content, forced=False, basename=None):
+    def output_preload(self, mode, content, forced=False, basename=None, sri_hash=""):
         """
         The output method that returns <link> with rel="preload" and
         proper href attribute for given file.
         """
-        return self.output_file(mode, content, forced, basename)
+        return self.output_file(mode, content, forced, basename, sri_hash=sri_hash)
 
     def render_output(self, mode, context=None):
         """
@@ -451,11 +456,14 @@ class Compressor:
         template_name = self.get_template_name(mode)
         return render_to_string(template_name, context=final_context)
 
-    def get_integrity(self, content):
+    def get_integrity(self, content, algorithm=None):
         """
         Returns the Subresource Integrity (SRI) string for the given content.
         """
         hashes = settings.COMPRESS_SRI_HASHES
+        algo = algorithm or settings.SRI_HASH_ALGORITHM
+        if algo and algo not in hashes:
+            hashes = (algo,)
         if not hashes:
             return ""
         content_bytes = content.encode(self.charset)

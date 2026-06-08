@@ -60,6 +60,9 @@ class CompressorConf(AppConf):
     # Subresource Integrity (SRI) settings for compiled assets.
     # Example: COMPRESS_SRI_HASHES = ("sha256", "sha384")
     SRI_HASHES = ()
+    # SRI hash algorithm to use when generating hashes during offline compression
+    # Example: "sha384"
+    SRI_HASH_ALGORITHM = "sha384"
     # Example: COMPRESS_SRI_CROSSORIGIN = "anonymous"
     SRI_CROSSORIGIN = None
 

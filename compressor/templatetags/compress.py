@@ -119,16 +119,23 @@ class CompressorMixin:
 
         # Check cache
         cache_key = None
+        sri_hash = ""
         if settings.COMPRESS_ENABLED and not forced:
             cache_key, cache_content = self.render_cached(compressor, kind, mode)
             if cache_content is not None:
                 return cache_content
+            # Try to get SRI hash from offline manifest
+            if settings.COMPRESS_OFFLINE:
+                offline_manifest = get_offline_manifest()
+                original_content = self.get_original_content(context)
+                offline_key = get_offline_hexdigest(original_content)
+                if offline_key in offline_manifest:
+                    sri_hash = offline_manifest[offline_key].get('sri_hash', '')
 
         file_basename = name or getattr(self, "basename", None)
         if file_basename is None:
             file_basename = "output"
-
-        rendered_output = compressor.output(mode, forced=forced, basename=file_basename)
+        rendered_output = compressor.output(mode, forced=forced, basename=file_basename, sri_hash=sri_hash)
         assert isinstance(rendered_output, str)
         if cache_key:
             cache_set(cache_key, rendered_output)
