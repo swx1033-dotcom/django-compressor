@@ -57,6 +57,10 @@ class CompressorConf(AppConf):
     CLEAN_CSS_ARGUMENTS = ""
     DATA_URI_MAX_SIZE = 1024
 
+    # Skip file existence checks when processing CSS URLs for better performance.
+    # Only enable this if you're certain all referenced files exist.
+    CSS_SKIP_FILE_EXISTS_CHECK = False
+
     # Subresource Integrity (SRI) settings for compiled assets.
     # Example: COMPRESS_SRI_HASHES = ("sha256", "sha384")
     SRI_HASHES = ()

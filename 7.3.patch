@@ -1,0 +1,188 @@
+diff --git a/compressor/conf.py b/compressor/conf.py
+index 6b90dbc..686737a 100644
+--- a/compressor/conf.py
++++ b/compressor/conf.py
+@@ -57,6 +57,10 @@ class CompressorConf(AppConf):
+     CLEAN_CSS_ARGUMENTS = ""
+     DATA_URI_MAX_SIZE = 1024
+ 
++    # Skip file existence checks when processing CSS URLs for better performance.
++    # Only enable this if you're certain all referenced files exist.
++    CSS_SKIP_FILE_EXISTS_CHECK = False
++
+     # Subresource Integrity (SRI) settings for compiled assets.
+     # Example: COMPRESS_SRI_HASHES = ("sha256", "sha384")
+     SRI_HASHES = ()
+diff --git a/compressor/filters/css_default.py b/compressor/filters/css_default.py
+index 41091ac..1aa1a5c 100644
+--- a/compressor/filters/css_default.py
++++ b/compressor/filters/css_default.py
+@@ -18,6 +18,12 @@ URL_PATTERN = re.compile(
+     re.VERBOSE,
+ )
+ SRC_PATTERN = re.compile(r'src=([\'"])(.*?)\1')
++COMBINED_PATTERN = re.compile(
++    r"""
++    (?:url\(\s*([\'"]?)(.*?)\1\s*\)) | (?:src=([\'"])(.*?)\3)
++""",
++    re.VERBOSE,
++)
+ SCHEMES = ("http://", "https://", "/")
+ 
+ 
+@@ -31,6 +37,8 @@ class CssAbsoluteFilter(FilterBase):
+         self.url = settings.COMPRESS_URL.rstrip("/")
+         self.url_path = self.url
+         self.has_scheme = False
++        self._url_cache = {}
++        self._filename_cache = {}
+ 
+     def input(self, filename=None, basename=None, **kwargs):
+         if not filename:
+@@ -45,27 +53,28 @@ class CssAbsoluteFilter(FilterBase):
+             self.protocol = "%s/" % "/".join(parts[:2])
+             self.host = parts[2]
+         self.directory_name = "/".join((self.url, os.path.dirname(self.path)))
+-        return SRC_PATTERN.sub(
+-            self.src_converter, URL_PATTERN.sub(self.url_converter, self.content)
+-        )
++        return COMBINED_PATTERN.sub(self._combined_converter, self.content)
+ 
+     def guess_filename(self, url):
++        if url in self._filename_cache:
++            return self._filename_cache[url]
++
+         local_path = url
+         if self.has_scheme:
+-            # COMPRESS_URL had a protocol,
+-            # remove it and the hostname from our path.
+             local_path = local_path.replace(self.protocol + self.host, "", 1)
+-        # remove url fragment, if any
+         local_path = local_path.rsplit("#", 1)[0]
+-        # remove querystring, if any
+         local_path = local_path.rsplit("?", 1)[0]
+-        # Now, we just need to check if we can find
+-        # the path from COMPRESS_URL in our url
+         if local_path.startswith(self.url_path):
+             local_path = local_path.replace(self.url_path, "", 1)
+-        # Re-build the local full path by adding root
+         filename = os.path.join(self.root, local_path.lstrip("/"))
+-        return os.path.exists(filename) and filename
++
++        if settings.COMPRESS_CSS_SKIP_FILE_EXISTS_CHECK:
++            result = filename
++        else:
++            result = os.path.exists(filename) and filename
++
++        self._filename_cache[url] = result
++        return result
+ 
+     def add_suffix(self, url):
+         filename = self.guess_filename(url)
+@@ -98,31 +107,37 @@ class CssAbsoluteFilter(FilterBase):
+         return url
+ 
+     def _converter(self, url):
++        if url in self._url_cache:
++            return self._url_cache[url]
++
+         if url.startswith(("#", "data:")):
+-            return url
++            result = url
+         elif url.startswith(SCHEMES):
+-            return self.add_suffix(url)
+-        full_url = posixpath.normpath("/".join([str(self.directory_name), url]))
+-        if self.has_scheme:
+-            full_url = "%s%s" % (self.protocol, full_url)
+-        full_url = self.add_suffix(full_url)
+-        return self.post_process_url(full_url)
++            result = self.add_suffix(url)
++        else:
++            full_url = posixpath.normpath("/".join([str(self.directory_name), url]))
++            if self.has_scheme:
++                full_url = "%s%s" % (self.protocol, full_url)
++            full_url = self.add_suffix(full_url)
++            result = self.post_process_url(full_url)
++
++        self._url_cache[url] = result
++        return result
+ 
+     def post_process_url(self, url):
+-        """
+-        Extra URL processing, to be overridden in subclasses.
+-        """
+         return url
+ 
+-    def url_converter(self, matchobj):
+-        quote = matchobj.group(1)
+-        converted_url = self._converter(matchobj.group(2))
+-        return "url(%s%s%s)" % (quote, converted_url, quote)
+-
+-    def src_converter(self, matchobj):
+-        quote = matchobj.group(1)
+-        converted_url = self._converter(matchobj.group(2))
+-        return "src=%s%s%s" % (quote, converted_url, quote)
++    def _combined_converter(self, matchobj):
++        url_match = matchobj.group(2)
++        if url_match is not None:
++            quote = matchobj.group(1)
++            converted_url = self._converter(url_match)
++            return "url(%s%s%s)" % (quote, converted_url, quote)
++        else:
++            quote = matchobj.group(3)
++            url_match = matchobj.group(4)
++            converted_url = self._converter(url_match)
++            return "src=%s%s%s" % (quote, converted_url, quote)
+ 
+ 
+ class CssRelativeFilter(CssAbsoluteFilter):
+@@ -133,6 +148,29 @@ class CssRelativeFilter(CssAbsoluteFilter):
+ 
+     run_with_compression_disabled = True
+ 
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self._relative_re = None
++        self._relative_new_prefix = None
++
++    def _ensure_relative_setup(self):
++        if self._relative_re is not None:
++            return
++        old_prefix = self.url
++        if self.has_scheme:
++            old_prefix = "{}{}".format(self.protocol, old_prefix)
++        self._relative_re = re.compile("^{}".format(re.escape(old_prefix)))
++
++        new_prefix = ".."
++        new_prefix += "/.." * len(
++            list(
++                filter(
++                    None, os.path.normpath(settings.COMPRESS_OUTPUT_DIR).split(os.sep)
++                )
++            )
++        )
++        self._relative_new_prefix = new_prefix
++
+     def post_process_url(self, url):
+         """
+         Replace ``settings.COMPRESS_URL`` URL prefix with  '../' * (N + 1)
+@@ -151,17 +189,5 @@ class CssRelativeFilter(CssAbsoluteFilter):
+         - compiled file URL: '/static/CACHE/css/output.abcdef123456.css'
+         - replaced image link URL: ``url(../../my-app/images/logo.svg)``
+         """
+-        old_prefix = self.url
+-        if self.has_scheme:
+-            old_prefix = "{}{}".format(self.protocol, old_prefix)
+-        # One level up from 'css' / 'js' folder
+-        new_prefix = ".."
+-        # N levels up from ``settings.COMPRESS_OUTPUT_DIR``
+-        new_prefix += "/.." * len(
+-            list(
+-                filter(
+-                    None, os.path.normpath(settings.COMPRESS_OUTPUT_DIR).split(os.sep)
+-                )
+-            )
+-        )
+-        return re.sub("^{}".format(old_prefix), new_prefix, url)
++        self._ensure_relative_setup()
++        return self._relative_re.sub(self._relative_new_prefix, url)
