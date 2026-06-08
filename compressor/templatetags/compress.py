@@ -72,7 +72,17 @@ class CompressorMixin:
         key = get_offline_hexdigest(original_content)
         offline_manifest = get_offline_manifest()
         if key in offline_manifest:
-            return offline_manifest[key].replace(
+            entry = offline_manifest[key]
+            if isinstance(entry, dict):
+                result = entry["result"]
+                sri_hash = entry.get("sri_hash", "")
+            else:
+                result = entry
+                sri_hash = ""
+            context["compressed"] = context.get("compressed", {})
+            if sri_hash:
+                context["compressed"]["sri_hash"] = sri_hash
+            return result.replace(
                 settings.COMPRESS_URL_PLACEHOLDER,
                 # Cast ``settings.COMPRESS_URL`` to a string to allow it to be
                 # a string-alike object to e.g. add ``SCRIPT_NAME`` WSGI param

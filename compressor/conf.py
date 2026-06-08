@@ -62,6 +62,9 @@ class CompressorConf(AppConf):
     SRI_HASHES = ()
     # Example: COMPRESS_SRI_CROSSORIGIN = "anonymous"
     SRI_CROSSORIGIN = None
+    # Algorithm used for offline SRI hash pre-computation.
+    # Supported values: "sha256", "sha384", "sha512"
+    SRI_HASH_ALGORITHM = "sha384"
 
     # the cache backend to use
     CACHE_BACKEND = None
@@ -179,3 +182,12 @@ class CompressorConf(AppConf):
         if value in (None, ""):
             return None
         return str(value)
+
+    def configure_sri_hash_algorithm(self, value):
+        allowed = {"sha256", "sha384", "sha512"}
+        if value not in allowed:
+            raise ImproperlyConfigured(
+                "The COMPRESS_SRI_HASH_ALGORITHM setting only supports "
+                "%s." % ", ".join(sorted(allowed))
+            )
+        return value

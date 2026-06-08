@@ -306,7 +306,10 @@ class Command(BaseCommand):
                 "done\nCompressed %d block(s) from %d template(s) for %d context(s).\n"
                 % (len(offline_manifest), nodes_count, contexts_count)
             )
-        return offline_manifest, len(offline_manifest), offline_manifest.values()
+        return offline_manifest, len(offline_manifest), [
+            v["result"] if isinstance(v, dict) else v
+            for v in offline_manifest.values()
+        ]
 
     @staticmethod
     def _compress_template(offline_manifest, nodes, parser, template, errors):
@@ -353,7 +356,11 @@ class Command(BaseCommand):
                 result = result.replace(
                     settings.COMPRESS_URL, settings.COMPRESS_URL_PLACEHOLDER
                 )
-                offline_manifest[key] = result
+                sri_hash = context.get("compressed", {}).get("sri_hash", "")
+                offline_manifest[key] = {
+                    "result": result,
+                    "sri_hash": sri_hash,
+                }
                 context.pop()
 
     def handle_extensions(self, extensions=("html",)):

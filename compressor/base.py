@@ -10,7 +10,7 @@ from django.utils.safestring import mark_safe
 from django.template.loader import render_to_string
 from django.utils.functional import cached_property
 
-from compressor.cache import get_hexdigest, get_mtime
+from compressor.cache import get_hexdigest, get_mtime, get_sri_hash
 from compressor.conf import settings
 from compressor.exceptions import (
     CompressorError,
@@ -366,7 +366,7 @@ class Compressor:
                 pass
         return content
 
-    def output(self, mode="file", forced=False, basename=None):
+    def output(self, mode="file", forced=False, basename=None, generate_sri=None):
         """
         The general output method, override in subclass if you need to do
         any custom modification. Calls other mode specific methods or simply
@@ -379,19 +379,19 @@ class Compressor:
 
         if settings.COMPRESS_ENABLED or forced:
             filtered_output = self.filter_output(output)
-            return self.handle_output(mode, filtered_output, forced, basename)
+            return self.handle_output(mode, filtered_output, forced, basename, generate_sri=generate_sri)
 
         return output
 
-    def handle_output(self, mode, content, forced, basename=None):
+    def handle_output(self, mode, content, forced, basename=None, generate_sri=None):
         # Then check for the appropriate output method and call it
         output_func = getattr(self, "output_%s" % mode, None)
         if callable(output_func):
-            return output_func(mode, content, forced, basename)
+            return output_func(mode, content, forced, basename, generate_sri=generate_sri)
         # Total failure, raise a general exception
         raise CompressorError("Couldn't find output method for mode '%s'" % mode)
 
-    def output_file(self, mode, content, forced=False, basename=None):
+    def output_file(self, mode, content, forced=False, basename=None, generate_sri=None):
         """
         The output method that saves the content to a file and renders
         the appropriate template with the file's URL.
@@ -401,27 +401,34 @@ class Compressor:
             self.storage.save(new_filepath, ContentFile(content.encode(self.charset)))
         url = mark_safe(self.storage.url(new_filepath))
         context = {"url": url}
-        integrity = self.get_integrity(content)
-        if integrity:
-            context["integrity"] = integrity
-            crossorigin = settings.COMPRESS_SRI_CROSSORIGIN
-            if crossorigin:
-                context["crossorigin"] = crossorigin
+        should_generate = generate_sri
+        if should_generate is None:
+            should_generate = bool(settings.COMPRESS_SRI_HASHES)
+        if should_generate:
+            integrity = self.get_integrity(content)
+            self._sri_hash = integrity
+            if integrity:
+                context["integrity"] = integrity
+                crossorigin = settings.COMPRESS_SRI_CROSSORIGIN
+                if crossorigin:
+                    context["crossorigin"] = crossorigin
+            sri_hash = get_sri_hash(content.encode(self.charset))
+            context["sri_hash"] = sri_hash
         return self.render_output(mode, context)
 
-    def output_inline(self, mode, content, forced=False, basename=None):
+    def output_inline(self, mode, content, forced=False, basename=None, generate_sri=None):
         """
         The output method that directly returns the content for inline
         display.
         """
         return self.render_output(mode, {"content": content})
 
-    def output_preload(self, mode, content, forced=False, basename=None):
+    def output_preload(self, mode, content, forced=False, basename=None, generate_sri=None):
         """
         The output method that returns <link> with rel="preload" and
         proper href attribute for given file.
         """
-        return self.output_file(mode, content, forced, basename)
+        return self.output_file(mode, content, forced, basename, generate_sri=generate_sri)
 
     def render_output(self, mode, context=None):
         """

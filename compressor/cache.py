@@ -1,4 +1,5 @@
 import json
+import base64
 import hashlib
 import os
 import socket
@@ -22,6 +23,14 @@ def get_hexdigest(plaintext, length=None):
     if length:
         return digest[:length]
     return digest
+
+
+def get_sri_hash(content_bytes, algorithm=None):
+    if algorithm is None:
+        algorithm = settings.COMPRESS_SRI_HASH_ALGORITHM
+    digest = hashlib.new(algorithm, content_bytes).digest()
+    encoded = base64.b64encode(digest).decode("ascii")
+    return "%s-%s" % (algorithm, encoded)
 
 
 def simple_cachekey(key):
