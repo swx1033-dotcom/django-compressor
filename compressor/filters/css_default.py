@@ -1,24 +1,38 @@
 import os
 import re
 import posixpath
+from functools import lru_cache
 
 from compressor.cache import get_hashed_mtime, get_hashed_content
 from compressor.conf import settings
 from compressor.filters import FilterBase, FilterError
 
-URL_PATTERN = re.compile(
-    r"""
-    url\(
-    \s*      # any amount of whitespace
-    ([\'"]?) # optional quote
-    (.*?)    # any amount of anything, non-greedily (this is the actual url)
-    \1       # matching quote (or nothing if there was none)
-    \s*      # any amount of whitespace
-    \)""",
-    re.VERBOSE,
-)
-SRC_PATTERN = re.compile(r'src=([\'"])(.*?)\1')
 SCHEMES = ("http://", "https://", "/")
+
+
+@lru_cache(maxsize=1)
+def get_resource_pattern():
+    return re.compile(
+        r"""
+        (?P<url>
+            url\(
+            \s*
+            (?P<url_quote>[\'"]?)
+            (?P<url_value>.*?)
+            (?P=url_quote)
+            \s*
+            \)
+        )
+        |
+        (?P<src>
+            src=
+            (?P<src_quote>[\'"])
+            (?P<src_value>.*?)
+            (?P=src_quote)
+        )
+        """,
+        re.VERBOSE,
+    )
 
 
 class CssAbsoluteFilter(FilterBase):
@@ -31,6 +45,12 @@ class CssAbsoluteFilter(FilterBase):
         self.url = settings.COMPRESS_URL.rstrip("/")
         self.url_path = self.url
         self.has_scheme = False
+        self.strict_path_checks = (
+            settings.COMPRESS_CSS_ABSOLUTE_FILTER_STRICT_PATH_CHECKS
+        )
+        self._converted_url_cache = {}
+        self._resolved_relative_url_cache = {}
+        self._filename_cache = {}
 
     def input(self, filename=None, basename=None, **kwargs):
         if not filename:
@@ -45,47 +65,53 @@ class CssAbsoluteFilter(FilterBase):
             self.protocol = "%s/" % "/".join(parts[:2])
             self.host = parts[2]
         self.directory_name = "/".join((self.url, os.path.dirname(self.path)))
-        return SRC_PATTERN.sub(
-            self.src_converter, URL_PATTERN.sub(self.url_converter, self.content)
-        )
+        return get_resource_pattern().sub(self.resource_converter, self.content)
 
     def guess_filename(self, url):
+        if url in self._filename_cache:
+            return self._filename_cache[url]
+
         local_path = url
         if self.has_scheme:
-            # COMPRESS_URL had a protocol,
-            # remove it and the hostname from our path.
             local_path = local_path.replace(self.protocol + self.host, "", 1)
-        # remove url fragment, if any
         local_path = local_path.rsplit("#", 1)[0]
-        # remove querystring, if any
         local_path = local_path.rsplit("?", 1)[0]
-        # Now, we just need to check if we can find
-        # the path from COMPRESS_URL in our url
         if local_path.startswith(self.url_path):
             local_path = local_path.replace(self.url_path, "", 1)
-        # Re-build the local full path by adding root
         filename = os.path.join(self.root, local_path.lstrip("/"))
-        return os.path.exists(filename) and filename
+        if self.strict_path_checks and not os.path.exists(filename):
+            filename = None
+        self._filename_cache[url] = filename
+        return filename
+
+    def get_hash_suffix(self, filename, hashing_method):
+        try:
+            if hashing_method == "mtime":
+                return get_hashed_mtime(filename)
+            if hashing_method in ("hash", "content"):
+                return get_hashed_content(filename)
+        except OSError:
+            return None
+        raise FilterError(
+            "COMPRESS_CSS_HASHING_METHOD is configured "
+            "with an unknown method (%s)." % hashing_method
+        )
 
     def add_suffix(self, url):
-        filename = self.guess_filename(url)
-        if not filename:
-            return url
-        if settings.COMPRESS_CSS_HASHING_METHOD is None:
+        hashing_method = settings.COMPRESS_CSS_HASHING_METHOD
+        if hashing_method is None:
             return url
         if not url.startswith(SCHEMES):
             return url
 
-        suffix = None
-        if settings.COMPRESS_CSS_HASHING_METHOD == "mtime":
-            suffix = get_hashed_mtime(filename)
-        elif settings.COMPRESS_CSS_HASHING_METHOD in ("hash", "content"):
-            suffix = get_hashed_content(filename)
-        else:
-            raise FilterError(
-                "COMPRESS_CSS_HASHING_METHOD is configured "
-                "with an unknown method (%s)." % settings.COMPRESS_CSS_HASHING_METHOD
-            )
+        filename = self.guess_filename(url)
+        if not filename:
+            return url
+
+        suffix = self.get_hash_suffix(filename, hashing_method)
+        if not suffix:
+            return url
+
         fragment = None
         if "#" in url:
             url, fragment = url.rsplit("#", 1)
@@ -97,16 +123,28 @@ class CssAbsoluteFilter(FilterBase):
             url = "%s#%s" % (url, fragment)
         return url
 
+    def _resolve_relative_url(self, url):
+        if url not in self._resolved_relative_url_cache:
+            full_url = posixpath.normpath("/".join([str(self.directory_name), url]))
+            if self.has_scheme:
+                full_url = "%s%s" % (self.protocol, full_url)
+            self._resolved_relative_url_cache[url] = full_url
+        return self._resolved_relative_url_cache[url]
+
     def _converter(self, url):
+        if url in self._converted_url_cache:
+            return self._converted_url_cache[url]
+
         if url.startswith(("#", "data:")):
-            return url
+            converted_url = url
         elif url.startswith(SCHEMES):
-            return self.add_suffix(url)
-        full_url = posixpath.normpath("/".join([str(self.directory_name), url]))
-        if self.has_scheme:
-            full_url = "%s%s" % (self.protocol, full_url)
-        full_url = self.add_suffix(full_url)
-        return self.post_process_url(full_url)
+            converted_url = self.add_suffix(url)
+        else:
+            full_url = self._resolve_relative_url(url)
+            converted_url = self.post_process_url(self.add_suffix(full_url))
+
+        self._converted_url_cache[url] = converted_url
+        return converted_url
 
     def post_process_url(self, url):
         """
@@ -114,14 +152,14 @@ class CssAbsoluteFilter(FilterBase):
         """
         return url
 
-    def url_converter(self, matchobj):
-        quote = matchobj.group(1)
-        converted_url = self._converter(matchobj.group(2))
-        return "url(%s%s%s)" % (quote, converted_url, quote)
+    def resource_converter(self, matchobj):
+        if matchobj.group("url") is not None:
+            quote = matchobj.group("url_quote")
+            converted_url = self._converter(matchobj.group("url_value"))
+            return "url(%s%s%s)" % (quote, converted_url, quote)
 
-    def src_converter(self, matchobj):
-        quote = matchobj.group(1)
-        converted_url = self._converter(matchobj.group(2))
+        quote = matchobj.group("src_quote")
+        converted_url = self._converter(matchobj.group("src_value"))
         return "src=%s%s%s" % (quote, converted_url, quote)
 
 
@@ -154,9 +192,7 @@ class CssRelativeFilter(CssAbsoluteFilter):
         old_prefix = self.url
         if self.has_scheme:
             old_prefix = "{}{}".format(self.protocol, old_prefix)
-        # One level up from 'css' / 'js' folder
         new_prefix = ".."
-        # N levels up from ``settings.COMPRESS_OUTPUT_DIR``
         new_prefix += "/.." * len(
             list(
                 filter(

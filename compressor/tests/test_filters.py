@@ -126,8 +126,6 @@ class PrecompilerTestCase(TestCase):
         self.assertEqual(type(compiler.input()), str)
 
     def test_precompiler_cache(self):
-        # The cache may already have data in it depending on the order the tests are
-        # run, so start by clearing it:
         cache.clear()
         command = "%s %s -f {infile} -o {outfile}" % (
             sys.executable,
@@ -135,24 +133,19 @@ class PrecompilerTestCase(TestCase):
         )
         compiler = CachedCompilerFilter(command=command, **self.cached_precompiler_args)
         self.assertEqual("body { color:#990; }", compiler.input())
-        # We tell whether the precompiler actually ran by inspecting compiler.infile. If not None, the compiler had to
-        # write the input out to the file for the external command. If None, it was in the cache and thus skipped.
-        self.assertIsNotNone(compiler.infile)  # Not cached
+        self.assertIsNotNone(compiler.infile)
 
         compiler = CachedCompilerFilter(command=command, **self.cached_precompiler_args)
         self.assertEqual("body { color:#990; }", compiler.input())
-        self.assertIsNone(compiler.infile)  # Cached
+        self.assertIsNone(compiler.infile)
 
-        self.cached_precompiler_args[
-            "content"
-        ] += " "  # Invalidate cache by slightly changing content
+        self.cached_precompiler_args["content"] += " "
         compiler = CachedCompilerFilter(command=command, **self.cached_precompiler_args)
         self.assertEqual("body { color:#990; }", compiler.input())
-        self.assertIsNotNone(compiler.infile)  # Not cached
+        self.assertIsNotNone(compiler.infile)
 
     @mock.patch("django.core.cache.backends.locmem.LocMemCache.get")
     def test_precompiler_cache_issue750(self, mock_cache):
-        # emulate memcached and return string
         mock_cache.side_effect = lambda key: str("body { color:#990; }")
         command = "%s %s -f {infile} -o {outfile}" % (
             sys.executable,
@@ -172,11 +165,11 @@ class PrecompilerTestCase(TestCase):
         self.cached_precompiler_args["mimetype"] = "text/different"
         compiler = CachedCompilerFilter(command=command, **self.cached_precompiler_args)
         self.assertEqual("body { color:#990; }", compiler.input())
-        self.assertIsNotNone(compiler.infile)  # Not cached
+        self.assertIsNotNone(compiler.infile)
 
         compiler = CachedCompilerFilter(command=command, **self.cached_precompiler_args)
         self.assertEqual("body { color:#990; }", compiler.input())
-        self.assertIsNotNone(compiler.infile)  # Not cached
+        self.assertIsNotNone(compiler.infile)
 
     def test_precompiler_caches_empty_files(self):
         command = "%s %s -f {infile} -o {outfile}" % (
@@ -239,19 +232,19 @@ class JsMinTestCase(TestCase):
  * django-compressor
  * Copyright (c) 2009-2014 Django Compressor authors
  */
-        var foo = "bar";"""
+        var foo = \"bar\";"""
         output = """/*!
  * django-compressor
  * Copyright (c) 2009-2014 Django Compressor authors
- */var foo="bar";"""
+ */var foo=\"bar\";"""
         self.assertEqual(output, rJSMinFilter(content).output())
 
 
 class CalmjsTestCase(TestCase):
     def test_calmjs_filter(self):
         content = """
-        var foo = "bar";"""
-        output = """var foo="bar";"""
+        var foo = \"bar\";"""
+        output = """var foo=\"bar\";"""
         self.assertEqual(output, CalmjsFilter(content).output())
 
 
@@ -445,6 +438,31 @@ p { filter: progid:DXImageTransform.Microsoft.AlphaImageLoader(src='%(compress_u
         filter = self.filter_class(content)
         self.assertEqual(path, filter.guess_filename(url))
 
+    @override_settings(COMPRESS_CSS_ABSOLUTE_FILTER_STRICT_PATH_CHECKS=False)
+    def test_guess_filename_can_skip_strict_path_checks(self):
+        url = "%s/img/missing-file.png" % settings.COMPRESS_URL.rstrip("/")
+        path = os.path.join(settings.COMPRESS_ROOT, "img/missing-file.png")
+        filter = self.filter_class("")
+        self.assertEqual(path, filter.guess_filename(url))
+
+    @override_settings(COMPRESS_CSS_HASHING_METHOD=None)
+    def test_reuses_cached_relative_url_resolution(self):
+        filename = os.path.join(settings.COMPRESS_ROOT, "css/url/test.css")
+        content = """
+        p { background: url('../../img/python.png') }
+        p { filter: Alpha(src='../../img/python.png') }
+        p { background: url("../../img/python.png") }
+        """
+        filter = self.filter_class(content)
+        with mock.patch.object(
+            filter,
+            "_resolve_relative_url",
+            wraps=filter._resolve_relative_url,
+        ) as resolve_relative_url:
+            output = filter.input(filename=filename, basename="css/url/test.css")
+        self.assertEqual(1, resolve_relative_url.call_count)
+        self.assertEqual(3, output.count(self.expected_url_prefix + "img/python.png"))
+
     def test_filenames_with_space(self):
         filename = os.path.join(settings.COMPRESS_ROOT, "css/url/test.css")
         imagefilename = os.path.join(settings.COMPRESS_ROOT, "img/add with spaces.png")
@@ -465,7 +483,7 @@ p { filter: progid:DXImageTransform.Microsoft.AlphaImageLoader(src='%(compress_u
         )
 
     def test_does_not_change_nested_urls(self):
-        css = """body { background-image: url("data:image/svg+xml;utf8,<svg><rect fill='url(%23gradient)'/></svg>");}"""
+        css = """body { background-image: url(\"data:image/svg+xml;utf8,<svg><rect fill='url(%23gradient)'/></svg>\");}"""
         filter = self.filter_class(css, filename="doesntmatter")
         self.assertEqual(
             css, filter.input(filename="doesntmatter", basename="doesntmatter")
@@ -476,7 +494,7 @@ p { filter: progid:DXImageTransform.Microsoft.AlphaImageLoader(src='%(compress_u
         hash_add_png = self.hashing_func(
             os.path.join(settings.COMPRESS_ROOT, "img/add.png")
         )
-        css = """p { filter: Alpha(src="/img/add.png%(hash)s") }"""
+        css = """p { filter: Alpha(src=\"/img/add.png%(hash)s\") }"""
         filter = self.filter_class(css % dict(hash=""))
         expected = css % dict(hash="?" + hash_add_png)
         self.assertEqual(
